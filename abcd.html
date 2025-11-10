@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Leaderboard & Chat</title>
+    <script src="https://js.puter.com/v2/"></script>
+    <script src="chat-data.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: #f8f9fa;
+            color: #2c3e50;
+            line-height: 1.6;
+        }
+
+        /* Colors: #2c3e50 (dark blue), #3498db (bright blue), #ecf0f1 (light gray) */
+
+        .navbar {
+            background-color: #2c3e50;
+            padding: 1rem 0;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .nav-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .nav-brand {
+            color: #ecf0f1;
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            list-style: none;
+        }
+
+        .nav-links a {
+            color: #ecf0f1;
+            text-decoration: none;
+            transition: color 0.3s;
+        }
+
+        .nav-links a:hover {
+            color: #3498db;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem 1rem;
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        .section {
+            background: white;
+            border-radius: 8px;
+            padding: 1.5rem;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .section-title {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 0.5rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .update-timer {
+            font-size: 0.8rem;
+            color: #7f8c8d;
+            font-weight: normal;
+        }
+
+        /* Leaderboard Styles */
+        .leaderboard-item {
+            display: flex;
+            align-items: center;
+            padding: 0.75rem;
+            margin-bottom: 0.5rem;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+            transition: transform 0.2s;
+        }
+
+        .leaderboard-item:hover {
+            transform: translateX(5px);
+        }
+
+        .rank {
+            font-weight: bold;
+            color: #3498db;
+            min-width: 30px;
+            font-size: 1.2rem;
+        }
+
+        .player-info {
+            display: flex;
+            align-items: center;
+            flex-grow: 1;
+            margin-left: 1rem;
+        }
+
+        .player-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            margin-right: 1rem;
+            object-fit: cover;
+            border: 2px solid #3498db;
+        }
+
+        .player-details {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .player-name {
+            font-weight: bold;
+            color: #2c3e50;
+        }
+
+        .player-country {
+            font-size: 0.8rem;
+            color: #7f8c8d;
+        }
+
+        .score {
+            font-weight: bold;
+            color: #2c3e50;
+            font-size: 1.1rem;
+        }
+
+        /* Chat Styles */
+        .chat-container {
+            height: 400px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .chat-messages {
+            flex-grow: 1;
+            overflow-y: auto;
+            border: 1px solid #ecf0f1;
+            border-radius: 4px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            background-color: #f8f9fa;
+        }
+
+        .message {
+            margin-bottom: 0.75rem;
+            padding: 0.5rem;
+            border-radius: 4px;
+            background-color: white;
+            animation: fadeIn 0.3s ease-in;
+            display: flex;
+            align-items: flex-start;
+        }
+
+        .message.user {
+            background-color: #3498db;
+            color: white;
+            margin-left: 20%;
+            flex-direction: row-reverse;
+        }
+
+        .message.auto {
+            margin-right: 20%;
+        }
+
+        .message.static {
+            border-left: 3px solid #e74c3c;
+        }
+
+        .message-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            margin: 0 0.75rem;
+            object-fit: cover;
+            border: 1px solid #ecf0f1;
+        }
+
+        .message-content {
+            flex-grow: 1;
+        }
+
+        .message-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.25rem;
+        }
+
+        .message-author {
+            font-weight: bold;
+            font-size: 0.9rem;
+        }
+
+        .message-time {
+            font-size: 0.7rem;
+            opacity: 0.7;
+        }
+
+        .message-text {
+            font-size: 0.9rem;
+        }
+
+        .message-country {
+            font-size: 0.75rem;
+            opacity: 0.8;
+            margin-top: 0.15rem;
+        }
+
+        /* Shimmer loading animation for country */
+        .shimmer {
+            display: inline-block;
+            height: 12px;
+            width: 80px;
+            background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+            background-size: 200% 100%;
+            animation: shimmer 1.5s infinite;
+            border-radius: 4px;
+        }
+
+        @keyframes shimmer {
+            0% {
+                background-position: -200% 0;
+            }
+            100% {
+                background-position: 200% 0;
+            }
+        }
+
+        .chat-input-container {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .chat-input {
+            flex-grow: 1;
+            padding: 0.75rem;
+            border: 1px solid #ecf0f1;
+            border-radius: 4px;
+            font-size: 1rem;
+        }
+
+        .send-btn {
+            padding: 0.75rem 1.5rem;
+            background-color: #3498db;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+
+        .send-btn:hover {
+            background-color: #2980b9;
+        }
+
+        /* Booking Section */
+        .booking-section {
+            background: white;
+            border-radius: 8px;
+            padding: 2rem;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        .booking-title {
+            font-size: 1.8rem;
+            margin-bottom: 1rem;
+            color: #2c3e50;
+        }
+
+        .booking-form {
+            max-width: 400px;
+            margin: 0 auto;
+        }
+
+        .form-group {
+            margin-bottom: 1rem;
+            text-align: left;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: bold;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid #ecf0f1;
+            border-radius: 4px;
+            font-size: 1rem;
+        }
+
+        .book-btn {
+            width: 100%;
+            padding: 1rem;
+            background-color: #2c3e50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 1.1rem;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+
+        .book-btn:hover {
+            background-color: #34495e;
+        }
+
+        /* Loading indicator */
+        .loading {
+            text-align: center;
+            padding: 1rem;
+            color: #7f8c8d;
+        }
+
+        /* Static messages indicator */
+        .static-indicator {
+            font-size: 0.7rem;
+            color: #e74c3c;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        /* Animations */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .nav-links {
+                display: none;
+            }
+
+            .message.user {
+                margin-left: 5%;
+            }
+
+            .message.auto {
+                margin-right: 5%;
+            }
+
+            .container {
+                padding: 1rem;
+            }
+
+            .player-info {
+                margin-left: 0.5rem;
+            }
+
+            .player-avatar {
+                width: 32px;
+                height: 32px;
+                margin-right: 0.5rem;
+            }
+
+            .message-avatar {
+                width: 28px;
+                height: 28px;
+                margin: 0 0.5rem;
+            }
+
+            .section-title {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .update-timer {
+                margin-top: 0.5rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="nav-container">
+            <div class="nav-brand">LiveHub</div>
+            <ul class="nav-links">
+                <li><a href="#leaderboard">Leaderboard</a></li>
+                <li><a href="#chat">Chat</a></li>
+                <li><a href="#booking">Book Now</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="container">
+        <div class="main-grid">
+            <!-- Leaderboard Section -->
+            <div class="section" id="leaderboard">
+                <h2 class="section-title">
+                    🏆 Top 10 Leaderboard
+                    <span class="update-timer" id="leaderboard-timer">Next update in: 6 weeks 5 days</span>
+                </h2>
+                <div id="leaderboard-content">
+                    <div class="loading">Loading leaderboard...</div>
+                </div>
+            </div>
+
+            <!-- Chat Section -->
+            <div class="section" id="chat">
+                <h2 class="section-title">💬 Live Chat</h2>
+                <div class="chat-container">
+                    <div class="chat-messages" id="chat-messages">
+                        <div class="loading">Loading chat...</div>
+                    </div>
+                    <div class="chat-input-container">
+                        <input type="text" class="chat-input" id="chat-input" placeholder="Type your message...">
+                        <button class="send-btn" onclick="sendMessage()">Send</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Booking Section -->
+        <div class="booking-section" id="booking">
+            <h2 class="booking-title">💳 Book Your Spot</h2>
+            <form class="booking-form" onsubmit="handleBooking(event)">
+                <div class="form-group">
+                    <label class="form-label" for="name">Full Name</label>
+                    <input type="text" class="form-input" id="name" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="email">Email</label>
+                    <input type="email" class="form-input" id="email" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="amount">Amount ($)</label>
+                    <input type="number" class="form-input" id="amount" min="1" value="50" required>
+                </div>
+                <button type="submit" class="book-btn">Pay & Book Now</button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // Static leaderboard data
+        const LEADERBOARD_DATA = [
+            {name: "Champion", score: 9999, country: "United States", countryEmoji: "🇺🇸", avatar: "https://picsum.photos/seed/Champion/100/100.jpg"},
+            {name: "EliteGamer", score: 8750, country: "Japan", countryEmoji: "🇯🇵", avatar: "https://picsum.photos/seed/EliteGamer/100/100.jpg"},
+            {name: "ProPlayer", score: 8420, country: "South Korea", countryEmoji: "🇰🇷", avatar: "https://picsum.photos/seed/ProPlayer/100/100.jpg"},
+            {name: "MasterMind", score: 8100, country: "Germany", countryEmoji: "🇩🇪", avatar: "https://picsum.photos/seed/MasterMind/100/100.jpg"},
+            {name: "SkillKing", score: 7850, country: "Canada", countryEmoji: "🇨🇦", avatar: "https://picsum.photos/seed/SkillKing/100/100.jpg"},
+            {name: "GameWizard", score: 7600, country: "United Kingdom", countryEmoji: "🇬🇧", avatar: "https://picsum.photos/seed/GameWizard/100/100.jpg"},
+            {name: "StrategyMaster", score: 7350, country: "France", countryEmoji: "🇫🇷", avatar: "https://picsum.photos/seed/StrategyMaster/100/100.jpg"},
+            {name: "TacticalGenius", score: 7100, country: "Australia", countryEmoji: "🇦🇺", avatar: "https://picsum.photos/seed/TacticalGenius/100/100.jpg"},
+            {name: "NinjaWarrior", score: 6850, country: "Brazil", countryEmoji: "🇧🇷", avatar: "https://picsum.photos/seed/NinjaWarrior/100/100.jpg"},
+            {name: "ShadowHunter", score: 6600, country: "Sweden", countryEmoji: "🇸🇪", avatar: "https://picsum.photos/seed/ShadowHunter/100/100.jpg"}
+        ];
+
+        // =================================================================
+        // END OF CONFIGURATION
+        // =================================================================
+
+        // Global variables
+        let chatMessages = [];
+        let leaderboardData = [...LEADERBOARD_DATA];
+        let lastApiCall = 0;
+        let currentMessageIndex = 0;
+        const API_CALL_INTERVAL = 10 * 60 * 1000; // 10 minutes
+        const MAX_MESSAGES = 300; // Increased from 50 to 300
+        const LEADERBOARD_UPDATE_INTERVAL = 7 * 7 * 24 * 60 * 60 * 1000; // 7 weeks in milliseconds
+
+        // Country data with emoji flags
+        const countries = [
+            { name: "United States", emoji: "🇺🇸" },
+            { name: "United Kingdom", emoji: "🇬🇧" },
+            { name: "Canada", emoji: "🇨🇦" },
+            { name: "Australia", emoji: "🇦🇺" },
+            { name: "Germany", emoji: "🇩🇪" },
+            { name: "France", emoji: "🇫🇷" },
+            { name: "Japan", emoji: "🇯🇵" },
+            { name: "South Korea", emoji: "🇰🇷" },
+            { name: "Brazil", emoji: "🇧🇷" },
+            { name: "India", emoji: "🇮🇳" },
+            { name: "China", emoji: "🇨🇳" },
+            { name: "Russia", emoji: "🇷🇺" },
+            { name: "Mexico", emoji: "🇲🇽" },
+            { name: "Spain", emoji: "🇪🇸" },
+            { name: "Italy", emoji: "🇮🇹" },
+            { name: "Netherlands", emoji: "🇳🇱" },
+            { name: "Sweden", emoji: "🇸🇪" },
+            { name: "Norway", emoji: "🇳🇴" },
+            { name: "Finland", emoji: "🇫🇮" },
+            { name: "Denmark", emoji: "🇩🇰" }
+        ];
+
+        // Initialize the application
+        document.addEventListener('DOMContentLoaded', function() {
+            initializeApp();
+            startLeaderboardTimer();
+        });
+
+        async function initializeApp() {
+            // Check if CHAT_DATA is available
+            if (typeof CHAT_DATA === 'undefined') {
+                console.error('CHAT_DATA is not defined. Make sure chat-data.js is loaded.');
+                // Fallback to empty array
+                window.CHAT_DATA = [];
+            }
+            
+            // Process chat data
+            processChatData();
+            
+            // Initialize displays
+            updateLeaderboardDisplay();
+            updateChatDisplay();
+            
+            // Start chat simulation
+            startChatSimulation();
+        }
+
+        // Process the chat data to add required fields
+        function processChatData() {
+            chatMessages = CHAT_DATA.map(msg => {
+                const country = countries[Math.floor(Math.random() * countries.length)];
+                return {
+                    ...msg,
+                    timestamp: new Date(Date.now() - Math.random() * 3600000).toLocaleTimeString(), // Random time within last hour
+                    country: country.name,
+                    countryEmoji: country.emoji,
+                    avatar: `https://picsum.photos/seed/${msg.username}/100/100.jpg`,
+                    isStatic: false
+                };
+            });
+            
+            currentMessageIndex = chatMessages.length;
+        }
+
+        // Start leaderboard timer
+        function startLeaderboardTimer() {
+            // Set the last update time to now
+            localStorage.setItem('lastLeaderboardUpdate', Date.now().toString());
+            
+            // Update the timer display every minute
+            setInterval(updateLeaderboardTimer, 60000);
+            
+            // Check for leaderboard update every day
+            setInterval(checkLeaderboardUpdate, 24 * 60 * 60 * 1000);
+        }
+
+        // Update leaderboard timer display
+        function updateLeaderboardTimer() {
+            const lastUpdate = localStorage.getItem('lastLeaderboardUpdate');
+            if (!lastUpdate) return;
+            
+            const lastUpdateTime = parseInt(lastUpdate);
+            const now = Date.now();
+            const timeSinceUpdate = now - lastUpdateTime;
+            const timeUntilUpdate = LEADERBOARD_UPDATE_INTERVAL - timeSinceUpdate;
+            
+            if (timeUntilUpdate <= 0) {
+                document.getElementById('leaderboard-timer').textContent = 'Updating now...';
+                return;
+            }
+            
+            const weeks = Math.floor(timeUntilUpdate / (7 * 24 * 60 * 60 * 1000));
+            const days = Math.floor((timeUntilUpdate % (7 * 24 * 60 * 60 * 1000)) / (24 * 60 * 60 * 1000));
+            
+            document.getElementById('leaderboard-timer').textContent = `Next update in: ${weeks} weeks ${days} days`;
+        }
+
+        // Check if leaderboard needs updating
+        function checkLeaderboardUpdate() {
+            const lastUpdate = localStorage.getItem('lastLeaderboardUpdate');
+            if (!lastUpdate) {
+                updateLeaderboard();
+                return;
+            }
+            
+            const lastUpdateTime = parseInt(lastUpdate);
+            const now = Date.now();
+            
+            if (now - lastUpdateTime >= LEADERBOARD_UPDATE_INTERVAL) {
+                updateLeaderboard();
+            }
+        }
+
+        // Update leaderboard with new data
+        function updateLeaderboard() {
+            // Simulate updating scores
+            leaderboardData = leaderboardData.map(player => {
+                const scoreChange = Math.floor(Math.random() * 200) - 100; // Random change between -100 and +100
+                const newScore = Math.max(1000, player.score + scoreChange); // Ensure score doesn't go below 1000
+                
+                return {
+                    ...player,
+                    score: newScore
+                };
+            });
+            
+            // Sort by score
+            leaderboardData.sort((a, b) => b.score - a.score);
+            
+            // Update display
+            updateLeaderboardDisplay();
+            
+            // Update last update time
+            localStorage.setItem('lastLeaderboardUpdate', Date.now().toString());
+            
+            // Update timer
+            updateLeaderboardTimer();
+        }
+
+        // Update leaderboard display
+        function updateLeaderboardDisplay() {
+            const container = document.getElementById('leaderboard-content');
+            container.innerHTML = '';
+            
+            leaderboardData.forEach((player, index) => {
+                const item = document.createElement('div');
+                item.className = 'leaderboard-item';
+                item.innerHTML = `
+                    <span class="rank">#${index + 1}</span>
+                    <div class="player-info">
+                        <img src="${player.avatar}" alt="${player.name}" class="player-avatar">
+                        <div class="player-details">
+                            <span class="player-name">${player.name}</span>
+                            <span class="player-country">${player.countryEmoji} ${player.country}</span>
+                        </div>
+                    </div>
+                    <span class="score">${player.score}</span>
+                `;
+                container.appendChild(item);
+            });
+        }
+
+        // Update chat display
+        function updateChatDisplay() {
+            const container = document.getElementById('chat-messages');
+            container.innerHTML = '';
+            
+            // Show only last 300 messages
+            const messagesToShow = chatMessages.slice(-MAX_MESSAGES);
+            
+            messagesToShow.forEach(msg => {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${msg.username === 'You' ? 'user' : 'auto'} ${msg.isStatic ? 'static' : ''}`;
+                
+                // Check if this is a user message to add shimmer effect for country
+                const countryDisplay = msg.username === 'You' ? 
+                    '<div class="shimmer"></div>' : 
+                    `<div class="message-country">${msg.countryEmoji} ${msg.country}</div>`;
+                
+                messageDiv.innerHTML = `
+                    <img src="${msg.avatar}" alt="${msg.username}" class="message-avatar">
+                    <div class="message-content">
+                        <div class="message-header">
+                            <span class="message-author">${msg.username}</span>
+                            <span class="message-time">${msg.timestamp}</span>
+                        </div>
+                        <div class="message-text">${msg.message}</div>
+                        ${countryDisplay}
+                        ${msg.isStatic ? '<div class="static-indicator">Official</div>' : ''}
+                    </div>
+                `;
+                container.appendChild(messageDiv);
+            });
+            
+            // Scroll to bottom
+            container.scrollTop = container.scrollHeight;
+        }
+
+        // Start chat simulation
+        function startChatSimulation() {
+            // Display messages from the JSON data gradually
+            const displayInterval = setInterval(() => {
+                if (currentMessageIndex < chatMessages.length) {
+                    // Just update the display, the message is already in the array
+                    updateChatDisplay();
+                    currentMessageIndex++;
+                } else {
+                    // When we've displayed all messages, start adding new ones via API
+                    clearInterval(displayInterval);
+                    
+                    // Start adding new messages every 10-20 seconds
+                    setInterval(() => {
+                        if (Math.random() > 0.3) { // 70% chance to add a message
+                            addNewMessage();
+                        }
+                    }, Math.random() * 10000 + 10000); // 10-20 seconds
+                }
+            }, 2000); // Display a new message every 2 seconds
+        }
+
+        // Add new message via API or fallback
+        async function addNewMessage() {
+            // Check if we can make an API call
+            const now = Date.now();
+            if (now - lastApiCall >= API_CALL_INTERVAL) {
+                // Make API call
+                try {
+                    const chatPrompt = "Generate a realistic chat message for a beauty/fashion community chat. Format as JSON: {username: 'User1', message: 'Hello!'}";
+                    const response = await puter.ai.chat(chatPrompt, { model: "gpt-5-nano" });
+                    
+                    try {
+                        const newMessage = JSON.parse(response);
+                        const country = countries[Math.floor(Math.random() * countries.length)];
+                        
+                        // Add required fields
+                        newMessage.timestamp = new Date().toLocaleTimeString();
+                        newMessage.country = country.name;
+                        newMessage.countryEmoji = country.emoji;
+                        newMessage.avatar = `https://picsum.photos/seed/${newMessage.username}/100/100.jpg`;
+                        newMessage.isStatic = false;
+                        
+                        // Add to chat
+                        chatMessages.push(newMessage);
+                        updateChatDisplay();
+                        
+                        // Update last API call time
+                        lastApiCall = now;
+                    } catch (e) {
+                        // If JSON parsing fails, use fallback
+                        addFallbackMessage();
+                    }
+                } catch (error) {
+                    console.error('Error making API call:', error);
+                    addFallbackMessage();
+                }
+            } else {
+                // Use fallback message
+                addFallbackMessage();
+            }
+        }
+
+        // Add fallback message
+        function addFallbackMessage() {
+            const fallbackMessages = [
+                {username: "BeautyGuru", message: "Has anyone tried the new collection yet?"},
+                {username: "Fashionista", message: "I'm obsessed with her latest outfit!"},
+                {username: "StyleExpert", message: "The makeup tutorial was so helpful!"},
+                {username: "TrendSetter", message: "Can't wait to see what she posts next!"},
+                {username: "GlamFan", message: "She's such an inspiration to us all!"}
+            ];
+            
+            const randomMessage = fallbackMessages[Math.floor(Math.random() * fallbackMessages.length)];
+            const country = countries[Math.floor(Math.random() * countries.length)];
+            
+            randomMessage.timestamp = new Date().toLocaleTimeString();
+            randomMessage.country = country.name;
+            randomMessage.countryEmoji = country.emoji;
+            randomMessage.avatar = `https://picsum.photos/seed/${randomMessage.username}/100/100.jpg`;
+            randomMessage.isStatic = false;
+            
+            chatMessages.push(randomMessage);
+            updateChatDisplay();
+        }
+
+        // Send user message
+        function sendMessage() {
+            const input = document.getElementById('chat-input');
+            const message = input.value.trim();
+            
+            if (message) {
+                // Get user info from form or use defaults
+                const userName = document.getElementById('name').value || "You";
+                
+                chatMessages.push({
+                    username: userName,
+                    message: message,
+                    timestamp: new Date().toLocaleTimeString(),
+                    country: "Loading...", // Will show shimmer effect
+                    countryEmoji: "",
+                    avatar: "https://i.imgur.com/TWy5mbE.png", // Generic gray male avatar
+                    isStatic: false,
+                    isViewer: true // Flag to identify viewer messages
+                });
+                
+                input.value = '';
+                updateChatDisplay();
+                
+                // Simulate loading country after a delay
+                setTimeout(() => {
+                    // Find the last message (which is the one we just added)
+                    const lastMessage = chatMessages[chatMessages.length - 1];
+                    if (lastMessage.username === userName) {
+                        const userCountry = countries[Math.floor(Math.random() * countries.length)];
+                        lastMessage.country = userCountry.name;
+                        lastMessage.countryEmoji = userCountry.emoji;
+                        updateChatDisplay();
+                    }
+                }, 1500); // 1.5 second delay to simulate loading
+            }
+        }
+
+        // Handle Enter key in chat input
+        document.getElementById('chat-input').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        // Handle booking form submission
+        function handleBooking(event) {
+            event.preventDefault();
+            
+            const name = document.getElementById('name').value;
+            const email = document.getElementById('email').value;
+            const amount = document.getElementById('amount').value;
+            
+            // Simulate payment processing
+            const bookBtn = event.target.querySelector('.book-btn');
+            bookBtn.textContent = 'Processing...';
+            bookBtn.disabled = true;
+            
+            setTimeout(() => {
+                bookBtn.textContent = 'Payment Successful! ✓';
+                bookBtn.style.backgroundColor = '#27ae60';
+                
+                // Show success message
+                const successDiv = document.createElement('div');
+                successDiv.style.cssText = `
+                    margin-top: 1rem;
+                    padding: 1rem;
+                    background-color: #d4edda;
+                    color: #155724;
+                    border-radius: 4px;
+                    text-align: center;
+                `;
+                successDiv.innerHTML = `
+                    <strong>Booking Confirmed!</strong><br>
+                    Thank you ${name}! Your booking of $${amount} has been processed.<br>
+                    Confirmation sent to ${email}
+                `;
+                
+                event.target.appendChild(successDiv);
+                
+                // Reset form after 3 seconds
+                setTimeout(() => {
+                    event.target.reset();
+                    bookBtn.textContent = 'Pay & Book Now';
+                    bookBtn.style.backgroundColor = '#2c3e50';
+                    bookBtn.disabled = false;
+                    successDiv.remove();
+                }, 3000);
+                
+            }, 2000);
+        }
+    </script>
+</body>
+</html>
