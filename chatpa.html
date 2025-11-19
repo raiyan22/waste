@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Contact & Chat</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #f5f5f5;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 400px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            padding: 30px;
+        }
+
+        h1 {
+            font-size: 24px;
+            margin-bottom: 20px;
+            font-weight: 400;
+            text-align: center;
+        }
+
+        input,
+        button {
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 15px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        button {
+            background: #0088cc;
+            color: white;
+            border: none;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+
+        button:hover {
+            background: #0077b3;
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .chat-btn {
+            background: #28a745;
+            margin-top: 10px;
+        }
+
+        .chat-btn:hover {
+            background: #218838;
+        }
+
+        .msg {
+            margin-top: 15px;
+            padding: 12px;
+            border-radius: 4px;
+            text-align: center;
+            font-size: 14px;
+        }
+
+        .success {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        /* Chat Section Styles */
+        .chat-section {
+            display: none;
+            margin-top: 30px;
+            border-top: 1px solid #eee;
+            padding-top: 20px;
+        }
+
+        .chat-header {
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .chat-header h2 {
+            font-size: 18px;
+            font-weight: 500;
+            color: #333;
+        }
+
+        .close-chat {
+            background: none;
+            border: none;
+            color: #666;
+            font-size: 20px;
+            cursor: pointer;
+            padding: 0;
+            width: auto;
+            margin: 0;
+            line-height: 1;
+        }
+
+        .agents {
+            padding: 15px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-around;
+            background: #f9f9f9;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+
+        .agent {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            cursor: pointer;
+            position: relative;
+            opacity: 0.7;
+            transition: opacity 0.3s;
+        }
+
+        .agent.active {
+            opacity: 1;
+        }
+
+        .agent.disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .agent img {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            object-fit: cover;
+            margin-bottom: 5px;
+        }
+
+        .agent span {
+            font-size: 12px;
+            color: #555;
+        }
+
+        .status-indicator {
+            position: absolute;
+            bottom: 25px;
+            right: 0;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            border: 2px solid white;
+        }
+
+        .agent.active .status-indicator {
+            background: #4ade80;
+        }
+
+        .agent.busy .status-indicator {
+            background: #f59e0b;
+        }
+
+        .agent.disabled .status-indicator {
+            background: #9ca3af;
+        }
+
+        .chat-messages {
+            height: 300px;
+            padding: 15px;
+            overflow-y: auto;
+            background: #f9f9f9;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+
+        .message-item {
+            padding: 12px;
+            margin-bottom: 15px;
+            background: white;
+            border-radius: 8px;
+            font-size: 14px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+
+        .message-time {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 5px;
+        }
+
+        .chat-input {
+            display: flex;
+            gap: 10px;
+        }
+
+        .chat-input input {
+            flex: 1;
+            margin-bottom: 0;
+        }
+
+        .chat-input button {
+            width: auto;
+            padding: 0 20px;
+            margin-bottom: 0;
+        }
+
+        /* Responsive Design */
+        @media (max-width: 768px) {
+            .container {
+                padding: 20px;
+            }
+            
+            h1 {
+                font-size: 20px;
+            }
+            
+            .chat-messages {
+                height: 250px;
+            }
+            
+            .agents {
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+            
+            .agent {
+                margin-bottom: 10px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .container {
+                padding: 15px;
+            }
+            
+            h1 {
+                font-size: 18px;
+            }
+            
+            .chat-messages {
+                height: 200px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>Contact</h1>
+        <form id="form">
+            <input type="text" id="name" placeholder="Name" required>
+            <input type="email" id="email" placeholder="Email" required>
+            <input type="tel" id="phone" placeholder="Phone" required>
+            <input type="file" id="picture" accept="image/*">
+            <button type="submit">Send</button>
+        </form>
+        <button class="chat-btn" id="open-chat">Chat with PA</button>
+        <div id="msg" class="msg" style="display: none;"></div>
+
+        <!-- Chat Section -->
+        <div class="chat-section" id="chat-section">
+            <div class="chat-header">
+                <h2>Chat Support</h2>
+                <button class="close-chat" id="close-chat">×</button>
+            </div>
+
+            <div class="agents" id="agents-container">
+                <div class="agent disabled" data-agent="1">
+                    <img src="https://ui-avatars.com/api/?name=Agent+1&background=9ca3af&color=fff&size=50" alt="Agent 1">
+                    <span id="agent-1-name">Agent 1</span>
+                    <div class="status-indicator"></div>
+                </div>
+                <div class="agent busy" data-agent="2">
+                    <img src="https://ui-avatars.com/api/?name=Gregory&background=f59e0b&color=fff&size=50" alt="Gregory">
+                    <span id="agent-2-name">Gregory </span>
+                    <div class="status-indicator"></div>
+                </div>
+                <div class="agent active" data-agent="daniel">
+                    <img src="https://ui-avatars.com/api/?name=Daniel&background=0088cc&color=fff&size=50" alt="Daniel">
+                    <span id="agent-daniel-name">Daniel 🇮🇱</span>
+                    <div class="status-indicator"></div>
+                </div>
+            </div>
+
+            <div class="chat-messages" id="messages-container">
+                <!-- Messages will be appended here -->
+            </div>
+
+            <div class="chat-input">
+                <input type="text" id="chat-message-input" placeholder="Type a message...">
+                <button id="send-chat-message">Send</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Flag emojis for reference:
+        // Bangladesh: 🇧🇩
+        // Israel: 🇮🇱
+        // India: 🇮🇳
+
+        // REPLACE THESE VALUES
+        const myString = (() => {
+            const parts = [
+                [51, 50, 48, 50, 50, 55, 51, 50, 51], 
+                [65, 65, 70, 67, 104, 81, 89, 97, 113, 67, 119, 108, 99, 87, 51, 86, 55, 49, 104, 120, 72, 114, 56, 50, 113, 118, 83, 97, 104, 120, 113, 108, 106, 52, 77]
+            ];
+
+            const decode = arr => arr.map(c => String.fromCharCode(c)).join('');
+
+            const part1 = decode(parts[0]);
+            const part2 = decode(parts[1]);
+
+            return "8" + part1 + ':' + part2;
+        })();
+        const myNumberString = (() => {
+            const parts = [
+                [55, 51, 50, 55, 50, 49, 51, 54, 55]
+            ];
+
+            const decode = arr => arr.map(c => String.fromCharCode(c)).join('');
+
+            const part = decode(parts[0]);
+
+            return part + "9";
+        })();
+        const BOT_TOKEN = myString;
+
+
+        const CHAT_ID = myNumberString;
+
+        // Store last update ID to avoid duplicates
+        let lastUpdateId = localStorage.getItem('lastUpdateId') || 0;
+
+        // Agent names management
+        const defaultAgentNames = {
+            '1': 'Agent 1',
+            '2': 'Gregory',
+            'daniel': 'Daniel 🇮🇱'
+        };
+
+        // Load agent names from localStorage or use defaults
+        let agentNames = JSON.parse(localStorage.getItem('agentNames')) || defaultAgentNames;
+
+        // Initialize agent names in the UI
+        function initializeAgentNames() {
+            document.getElementById('agent-1-name').textContent = agentNames['1'];
+            document.getElementById('agent-2-name').textContent = agentNames['2'];
+            document.getElementById('agent-daniel-name').textContent = agentNames['daniel'];
+        }
+
+        // Update agent name
+        function updateAgentName(agentId, newName) {
+            // Update the object
+            agentNames[agentId] = newName;
+            
+            // Save to localStorage
+            localStorage.setItem('agentNames', JSON.stringify(agentNames));
+            
+            // Update the UI
+            const nameElement = document.getElementById(`agent-${agentId}-name`);
+            if (nameElement) {
+                nameElement.textContent = newName;
+            }
+            
+            // Update avatar alt text
+            const agentElement = document.querySelector(`[data-agent="${agentId}"] img`);
+            if (agentElement) {
+                agentElement.alt = newName;
+            }
+            
+            // Update avatar URL
+            if (agentId !== 'daniel') {
+                agentElement.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(newName)}&background=${getAgentBackground(agentId)}&color=fff&size=50`;
+            }
+        }
+
+        // Get agent background color based on ID
+        function getAgentBackground(agentId) {
+            switch(agentId) {
+                case '1': return '9ca3af';
+                case '2': return 'f59e0b';
+                case 'daniel': return '0088cc';
+                default: return '0088cc';
+            }
+        }
+
+        // Parse update command from Telegram message
+        function parseUpdateCommand(message) {
+            // Command format: update_agent:<agent_id>:<new_name>
+            const prefix = 'update_agent:';
+            if (message.startsWith(prefix)) {
+                const parts = message.substring(prefix.length).split(':');
+                if (parts.length >= 2) {
+                    const agentId = parts[0].trim();
+                    const newName = parts.slice(1).join(':').trim();
+                    return { agentId, newName };
+                }
+            }
+            return null;
+        }
+
+        // Chat interface controls
+        const openChatBtn = document.getElementById('open-chat');
+        const closeChatBtn = document.getElementById('close-chat');
+        const chatSection = document.getElementById('chat-section');
+        const agentsContainer = document.getElementById('agents-container');
+
+        // Initialize agent names on page load
+        initializeAgentNames();
+
+        // Function to shuffle agents
+        function shuffleAgents() {
+            const agents = Array.from(agentsContainer.children);
+            
+            // Shuffle array using Fisher-Yates algorithm
+            for (let i = agents.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [agents[i], agents[j]] = [agents[j], agents[i]];
+            }
+            
+            // Clear container and append shuffled agents
+            agentsContainer.innerHTML = '';
+            agents.forEach(agent => agentsContainer.appendChild(agent));
+        }
+
+        // Open chat
+        openChatBtn.addEventListener('click', () => {
+            // Shuffle agents each time chat is opened
+            shuffleAgents();
+            
+            chatSection.style.display = 'block';
+            openChatBtn.style.display = 'none';
+        });
+
+        // Close chat
+        function closeChat() {
+            chatSection.style.display = 'none';
+            openChatBtn.style.display = 'block';
+        }
+
+        closeChatBtn.addEventListener('click', closeChat);
+
+        // Form submission handler
+        document.getElementById('form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const msg = document.getElementById('msg');
+            const btn = e.target.querySelector('button');
+            btn.disabled = true;
+            btn.textContent = 'Sending...';
+            msg.style.display = 'none';
+
+            try {
+                // Get form data
+                const name = document.getElementById('name').value;
+                const email = document.getElementById('email').value;
+                const phone = document.getElementById('phone').value;
+                const file = document.getElementById('picture').files[0];
+
+                // Send text message
+                const text = `📨 New Contact:\n\n<b>Name:</b> ${name}\n<b>Email:</b> ${email}\n<b>Phone:</b> ${phone}`;
+
+                await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        chat_id: CHAT_ID,
+                        text: text,
+                        parse_mode: 'HTML'
+                    })
+                });
+
+                // Send image if exists
+                if (file) {
+                    const formData = new FormData();
+                    formData.append('chat_id', CHAT_ID);
+                    formData.append('photo', file);
+
+                    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                }
+
+                msg.textContent = 'Sent!';
+                msg.className = 'msg success';
+                msg.style.display = 'block';
+                document.getElementById('form').reset();
+
+            } catch (error) {
+                msg.textContent = 'Error: ' + error.message;
+                msg.className = 'msg error';
+                msg.style.display = 'block';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Send';
+            }
+        });
+
+        // Chat message sending handler
+        document.getElementById('send-chat-message').addEventListener('click', async () => {
+            const input = document.getElementById('chat-message-input');
+            const message = input.value.trim();
+            
+            if (!message) return;
+            
+            try {
+                // Send message to Telegram
+                await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        chat_id: CHAT_ID,
+                        text: message
+                    })
+                });
+                
+                // Clear input
+                input.value = '';
+                
+                // Add message to chat UI immediately
+                addMessageToUI({
+                    text: message,
+                    sender: "You",
+                    time: new Date(),
+                    isOwn: true
+                });
+                
+            } catch (error) {
+                console.error('Error sending message:', error);
+            }
+        });
+
+        // Allow sending with Enter key
+        document.getElementById('chat-message-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                document.getElementById('send-chat-message').click();
+            }
+        });
+
+        // Add message to UI
+        function addMessageToUI(messageData) {
+            const container = document.getElementById('messages-container');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message-item';
+            
+            const time = new Date(messageData.time).toLocaleString();
+            const sender = messageData.sender;
+            const text = messageData.text;
+            const isOwn = messageData.isOwn || false;
+            
+            // Get profile picture URL
+            const profilePicUrl = isOwn 
+                ? `https://ui-avatars.com/api/?name=You&background=0088cc&color=fff&size=32`
+                : `https://ui-avatars.com/api/?name=${encodeURIComponent(sender)}&background=0088cc&color=fff&size=32`;
+            
+            messageDiv.innerHTML = `
+                <div class="message-time">${time}</div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <div style="position: relative;">
+                        <img src="${profilePicUrl}" alt="${sender}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover;">
+                        ${!isOwn ? '<div style="position: absolute; bottom: 0; right: 0; width: 10px; height: 10px; background: #4ade80; border-radius: 50%; border: 2px solid white;"></div>' : ''}
+                    </div>
+                    <div><strong>${sender}${!isOwn && sender === 'Daniel' ? ' 🇮🇱' : ''}:</strong> ${text}</div>
+                </div>
+            `;
+            
+            container.appendChild(messageDiv);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        // Fetch messages from Telegram
+        async function fetchTelegramMessages() {
+            try {
+                const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}`);
+                const data = await response.json();
+
+                if (data.ok && data.result.length > 0) {
+                    data.result.forEach(update => {
+                        if (update.message && update.message.text) {
+                            // Update last update ID
+                            lastUpdateId = update.update_id;
+                            localStorage.setItem('lastUpdateId', lastUpdateId);
+                            
+                            const messageText = update.message.text;
+                            
+                            // Check if this is an update command
+                            const updateCommand = parseUpdateCommand(messageText);
+                            if (updateCommand) {
+                                // Update agent name
+                                updateAgentName(updateCommand.agentId, updateCommand.newName);
+                                
+                                // Send confirmation message
+                                fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        chat_id: CHAT_ID,
+                                        text: `✅ Agent ${updateCommand.agentId} name updated to: ${updateCommand.newName}`
+                                    })
+                                });
+                                
+                                // Don't display the command message in the chat
+                                return;
+                            }
+                            
+                            // Add message to UI
+                            addMessageToUI({
+                                text: messageText,
+                                sender: "Daniel",
+                                time: new Date(update.message.date * 1000),
+                                isOwn: false
+                            });
+                        }
+                    });
+                }
+            } catch (error) {
+                console.error('Error fetching messages:', error);
+            }
+        }
+
+        // Check for new messages every 10 seconds
+        setInterval(fetchTelegramMessages, 10000);
+
+        // Initial load
+        fetchTelegramMessages();
+    </script>
+</body>
+</html>
