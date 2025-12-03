@@ -1,111 +1,133 @@
-# Download an image from Docker Hub
-docker pull <image_name>
-# Example: docker pull nginx
+### Download an image from Docker Hub
+```docker pull <image_name>```
+### Example: docker pull nginx
 
-# List all images stored locally on your machine
-docker images
+### List all images stored locally
+```docker images```
 
-# Build an image from a Dockerfile in the current directory (.)
-# -t assigns a name (tag) to the image
-docker build -t <my_image_name> .
+### Build an image from a Dockerfile in the current directory (.)
+```docker build -t <my_image_name> .```
 
-# Delete an image from your disk
-docker rmi <image_id_or_name>
+### Delete an image
+```docker rmi <image_id_or_name>```
 
-# Delete all unused images (dangling images)
-docker image prune
+### Delete all dangling (unused/untagged) images
+```docker image prune```
 
-
-
-# Create and start a container
-# -d: Run in background (detached)
-# -p: Map ports (HostPort:ContainerPort)
-# --name: Assign a custom name
+### Create and start a container (detached mode, port mapped)
 docker run -d -p 8080:80 --name my-web-server nginx
 
-# List currently RUNNING containers
+### List RUNNING containers
 docker ps
 
-# List ALL containers (running and stopped)
+### List ALL containers (running and stopped)
 docker ps -a
 
-# Stop a running container
-docker stop <container_id_or_name>
+### Lifecycle management
+docker stop <container_id>
+docker start <container_id>
+docker rm <container_id>   ### Must be stopped first
 
-# Start a stopped container
-docker start <container_id_or_name>
+### View logs (essential for debugging)
+docker logs -f <container_id>
 
-# Delete a container (must be stopped first)
-docker rm <container_id_or_name>
+### Open a shell inside a running container
+docker exec -it <container_id> bash
+### Note: Use 'sh' for Alpine Linux images
 
-# View the output/logs of a container (Critical for debugging)
-docker logs <container_id_or_name>
-
-# Follow the logs in real-time (like tail -f)
-docker logs -f <container_id_or_name>
-
-# Open a command prompt (shell) inside a running container
-docker exec -it <container_id_or_name> bash
-# Note: Use 'sh' instead of 'bash' if the image is Alpine Linux
-
-
-
-
-
-
-# Create a new volume
+### Create a persistent volume
 docker volume create <volume_name>
 
-# List all volumes
+### List volumes
 docker volume ls
 
-# View volume details (find where data is stored on host)
+### Inspect volume (find physical location on host)
 docker volume inspect <volume_name>
 
-# Delete a volume (WARNING: This deletes the data)
+### Delete a volume (Data will be lost)
 docker volume rm <volume_name>
 
-# Usage Example: Running a container with a volume attached
-# Syntax: -v <volume_name>:<path_inside_container>
+### Run container with volume attached
+### Syntax: -v <volume_name>:<container_path>
 docker run -d -v my_data:/var/lib/mysql mysql
 
-
-
-
-
-
-# Create a custom bridge network
+### Create a custom bridge network
 docker network create <network_name>
 
-# List all networks
+### List networks
 docker network ls
 
-# View network details (subnet, connected containers, IPs)
+### View network details (subnet, connected IPs)
 docker network inspect <network_name>
 
-# Connect a running container to a specific network
+### Connect/Disconnect running containers
 docker network connect <network_name> <container_name>
-
-# Disconnect a container from a network
 docker network disconnect <network_name> <container_name>
 
-# Delete a network
-docker network rm <network_name>
-
-# Usage Example: Run a container inside a specific network
+### Run container attached to specific network
 docker run -d --net <network_name> nginx
 
-
-
-
-
-
-# Removes:
-# 1. Stopped containers
-# 2. Unused networks
-# 3. Dangling images (images with no name/tag)
-# 4. Build cache
+### Removes stopped containers, unused networks, and dangling images
 docker system prune
 
-# To also include unused volumes, add the --volumes flag:
+### Include unused volumes in the cleanup
 docker system prune --volumes
+
+### Pulls image if missing, runs it, prints text, and exits
+docker run hello-world
+
+### 1. Create a custom network
+docker network create tutorial-net
+
+### 2. Run Server (attached to network)
+docker run -d --name my-web-server --network tutorial-net nginx
+
+### 3. Run Client (curl) to test connection
+### Note: We use the container name 'my-web-server' as the URL
+docker run --rm --network tutorial-net curlimages/curl http://my-web-server
+
+### 1. Create volume
+docker volume create my-website-data
+
+### 2. Run container with mounted volume
+docker run -d -p 8080:80 -v my-website-data:/usr/share/nginx/html --name persistent-web nginx
+
+### 3. Modify data inside the volume
+docker exec persistent-web bash -c "echo '<h1>Persistence Works!</h1>' > /usr/share/nginx/html/index.html"
+
+### 4. Delete the container (Force remove)
+docker rm -f persistent-web
+
+### 5. Create NEW container with SAME volume
+docker run -d -p 8080:80 -v my-website-data:/usr/share/nginx/html --name new-web nginx
+
+### 6. Verify data persists
+curl localhost:8080
+
+### Mounts volume AND current directory, then tars the data
+docker run --rm \
+  -v my-website-data:/source_data \
+  -v $(pwd):/backup_dir \
+  ubuntu \
+  tar cvf /backup_dir/backup.tar -C /source_data .
+
+  ### 1. Destroy data
+docker volume rm my-website-data
+
+### 2. Create fresh volume
+docker volume create restored-volume
+
+### 3. Extract tar into new volume
+docker run --rm \
+  -v restored-volume:/target_data \
+  -v $(pwd):/backup_dir \
+  ubuntu \
+  bash -c "tar xvf /backup_dir/backup.tar -C /target_data"
+
+### 4. Verify content
+docker run --rm -v restored-volume:/data ubuntu cat /data/index.html
+
+docker rm -f my-web-server new-web
+docker network rm tutorial-net
+docker volume rm restored-volume
+rm backup.tar
