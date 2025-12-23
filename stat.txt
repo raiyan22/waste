@@ -1,0 +1,61 @@
+Role: Act as a Senior Full Stack Architect and AI Engineer.
+
+Context:
+I have built a functional MVP of a "Resume Compiler" inspired by Resumefy.pro.
+
+Tech Stack: FastAPI (Python), SQLModel, SQLite (will move to Postgres), Playwright, Vanilla JavaScript (Frontend), Argon2 (Auth).
+Current Features: Basic Auth (JWT), Simple Resume Generation (Keyword Matching), History (PDFs stored in DB), Basic Profile.
+Current Project Structure:
+backend/main.py (FastAPI app with Playwright PDF generation)
+frontend/ (Vanilla JS/HTML)
+The Goal:
+I want to scale this MVP to a "Full Fledged" SaaS product that matches the feature set of [https://www.resumefy.pro/]. The focus must be on ATS Optimization, Master Profile Management, and AI-driven Tailoring.
+
+Your Task:
+Provide a comprehensive architectural plan and code implementation guide to upgrade the current codebase. Please break down the solution into the following phases:
+
+Phase 1: Data Model Expansion (The "Single Source of Truth")
+Update the backend/models.py SQLModel definitions to support a robust Master Profile. Do not just use a raw JSON string. Create relations for:
+
+Work Experience: (Company, Role, Description, StartDate, EndDate).
+Education: (School, Degree, StartDate, EndDate).
+Projects: (Name, Description, TechStack).
+Skills: (Categorized: Technical, Soft, Tools).
+Explain how these relations will link to the User table.
+Phase 2: AI "Compiler" Logic (Replacing Keyword Matching)
+I am using uv add groq (for Llama3) or can use OpenAI.
+Write the Python logic to replace my simple keyword matcher with an LLM "Compiler".
+
+Create a function tailor_resume(user_profile, job_description) that sends the full Master Profile and JD to the AI.
+The AI must return a structured JSON object containing the specific work experience, projects, and skills relevant to that specific JD.
+Constraint: Ensure the prompt engineering enforces a "One Page Rule" if the content is too long.
+Phase 3: ATS-Friendly Templates (Jinja2)
+I currently use a simple HTML string. I need multiple ATS-friendly templates.
+
+Design the directory structure for backend/templates/ (e.g., ats_harvard.html, ats_modern.html).
+Provide the code for 2 distinct ATS templates:
+Template A (Harvard/Classic): Standard Times New Roman, simple bullet points, high keyword density.
+Template B (Google/Modern): Clean sans-serif (Roboto/Arial), minimal layout.
+Requirement: Both templates must use standard CSS (no complex floats, no images, semantic HTML) to pass ATS parsers.
+Update the main.py generation endpoint to accept a template_id parameter and render the correct Jinja2 file.
+Phase 4: Job Tracker System
+Implement the backend logic for a Job Tracker.
+
+Create backend/models.py for JobApplication (Company, Role, Status, AppliedDate, ResumeLink).
+Create API endpoints: POST /jobs, GET /jobs, PATCH /jobs/{id}.
+Frontend: Provide the Vanilla JS code to render a Kanban-style board or a List view for this tracker in frontend/index.html.
+Phase 5: File Storage & Optimization
+Currently, I store PDFs in the SQLite BLOB (bad for scaling).
+
+Advise on the code changes required to store PDFs in a local folder storage/pdfs/{user_id}/ instead of the DB.
+Write a helper function save_pdf_locally(pdf_bytes, user_id, filename) that returns the relative path.
+Phase 6: ATS Scoring (The "Secret Sauce")
+I want to show the user an "ATS Match Score" before they download.
+
+Write a Python function calculate_ats_score(resume_text, job_description).
+Logic: It should calculate the percentage of "Hard Skills" found in the Job Description that are present in the generated Resume Text.
+Return an integer (0-100).
+Output Format:
+Please provide the code in code blocks separated by filename (e.g., # backend/models.py, # backend/main.py, # frontend/app.js logic). Focus on clean, "Right Way" implementation that handles errors and scales.
+
+PROMPT END
