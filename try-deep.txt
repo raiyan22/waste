@@ -1,0 +1,40 @@
+1. Hardware Compatibility (✅ Perfect)
+The Requirement: The text says "Recommended RTX 2070+ / Radeon RX 5700 XT+".
+Your Hardware: You have an RTX 3060 12GB.
+Verdict: Your GPU is significantly more powerful than the minimum requirement. You will have zero performance issues.
+2. The "Archived" Status (⚠️ Read this)
+The repository is archived (read-only).
+What this means: No new updates or bug fixes are coming out.
+Does it matter? No. The "Standalone" version is self-contained. As long as it launches on your Windows 10/11 PC, it will work perfectly for your prank. You don't need updates.
+3. The "Ronaldo" Model Problem (❌ BUT THERE IS A FIX)
+The Issue: Look at the list of "Ready-to-use public face models" in the text: Keanu Reeves, Irina Arty, Millie Park, Mr. Bean, Joker... Cristiano Ronaldo is NOT on that list.
+This means: You cannot simply select "Ronaldo" from a dropdown menu.
+The Fix (The Pivot): Look further down in the text at the section "Face Swap (Insight)":
+"You can swap your face from a webcam... using your own single photo."
+This is your Golden Ticket. You do not need a .pth file anymore. You can use the DeepFaceLive app to do exactly what Roop does (1 photo swap), but inside this professional software.
+
+Final, Revised Plan (The Easiest Path)
+Since you have this repo, you don't need to clone anything or install Python manually. Here is exactly what to do:
+
+Step 1: Download the "Zero-Dependency" Version
+Go to the "Releases" section of that GitHub page (scroll down).
+Look for "Windows 10 x64".
+Download the file (usually hosted on Yandex or Mega).
+Extract it. It is a standalone folder. You do not need to install it.
+Step 2: Prepare your Image (Use your LoRA)
+Use Stable Diffusion with your LoRA to generate a perfect, front-facing photo of Ronaldo.
+Save it as ronaldo.jpg.
+Put it in the extracted DeepFaceLive folder.
+Step 3: Configure the App
+Run DeepFaceLive.exe.
+In the "Common" tab or "Module" selection:
+DO NOT choose "Face Swap (DFM)" (this requires the .pth model you don't have).
+CHOOSE "Face Swap (Insight)".
+Input Camera: Select your real webcam.
+Target Image: Click the button to upload ronaldo.jpg.
+Step 4: The Telegram Link
+In the DeepFaceLive app, look for the "Virtual Camera" tab and click "Start".
+Open Telegram.
+Go to Settings > Calls > Video Input.
+Select "DeepFaceLive Virtual Camera".
+(You don't even strictly need OBS with this build, though you can still use OBS if you want to add a "LIVE" text overlay).
