@@ -45,9 +45,69 @@ Put your reference.wav file there.
 Create a file named engine.py.
 Paste this code into engine.py:
 
-python
 
+
+```
 import tkinter as tk
+from tkinter import scrolledtext, messagebox
+import threading
+import queue
+import torch
+import sounddevice as sd
+import numpy as np
+from TTS.api import TTS
+import sys
+import os
+
+# --- CONFIGURATION ---
+# 1. DEVICE: "cuda" for RTX 3060. Change to "cpu" if you have issues.
+DEVICE = "cuda"
+
+# 2. MODEL: XTTS v2 is the best for cloning.
+MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
+
+# 3. AUDIO: Name of your reference file. MUST be in the same folder.
+REFERENCE_AUDIO = "reference.wav"
+
+# 4. LANGUAGE
+LANGUAGE = "en"
+
+# 5. AUDIO SETTINGS (Don't touch unless you know why)
+SAMPLE_RATE = 24000
+
+class AudioEngine:
+    def __init__(self):
+        self.audio_queue = queue.Queue()
+        self.lock = threading.Lock()
+        self.buffer = []
+        
+        # Check for reference file
+        if not os.path.exists(REFERENCE_AUDIO):
+            print(f"ERROR: '{REFERENCE_AUDIO}' not found!")
+            sys.exit(1)
+
+        print(f"🎧 Initializing Audio Stream on: {sd.query_devices(sd.default.device['output'])['name']}")
+        try:
+            self.stream = sd.OutputStream(
+                samplerate=SAMPLE_RATE, 
+                channels=1, 
+                callback=self._audio_callback, 
+                blocksize=2048
+            )
+            self.stream.start()
+        except Exception as e:
+            print(f"❌ Audio Error: {e}")
+            print("Did you install VB-Cable and restart?")
+            sys.exit(1)
+
+        # Load the Model
+        print(f"⏳ Loading XTTS Model on {DEVICE}... (Grab a coffee, first time is slow)")
+        self.tts = TTS(MODEL_NAME).to(DEVICE)
+        print("✅ Model Ready! Let's prank.")
+
+    def _audio_callback(self, outdata, frames, time_info, status):
+        if status:
+            print(f"⚠️ Stream Underflow: {status}", file=sys.stderr)
         
         with self.lock:
             if len(self.buffer) > 0:
@@ -137,6 +197,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"CRITICAL ERROR: {e}")
         input("Press Enter to exit...")
+```
+
+
+
+
+
 STEP 5: Configure Telegram
 Open Telegram Desktop.
 Go to Settings -> Advanced -> Call Settings.
