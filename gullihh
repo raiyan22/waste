@@ -1,0 +1,5085 @@
+
+
+# Gulli Codebase — context01.md (Complete)
+
+চলো step by step বুঝি। আমি overwhelm করবো না — section by section যাবো।
+
+---
+
+## Step 1: Gulli কী করে? (Big Picture)
+
+```
+Gulli হলো একটা "Security Vulnerability Monitor"
+
+কাজ:
+1. Google Sheet থেকে পড়ে — কোন কোন software/feed monitor করতে হবে
+2. সেই feed গুলো থেকে নতুন security vulnerability খোঁজে
+3. নতুন কিছু পেলে:
+   - Google Sheet-এ লিখে রাখে (tracking)
+   - JIRA ticket বানায়
+   - Slack-এ notify করে
+4. পুরনো বা already-known vulnerability ignore করে
+```
+
+**Python analogy:** ভাবো একটা Python script যেটা:
+```python
+feeds = read_google_sheet("which feeds to monitor")
+for feed in feeds:
+    articles = fetch_new_vulnerabilities(feed)
+    for article in articles:
+        if not already_in_sheet(article):
+            save_to_sheet(article)
+            create_jira_ticket(article)
+            send_slack_notification(article)
+```
+
+---
+
+## Step 2: কিভাবে চলে? (Flow)
+
+```
+bin/gulli (entry point — script চালায়)
+    ↓
+Gulli.run (lib/gulli.rb)
+    ↓
+┌─ FetchFeeds → Google Sheet "Feeds" tab পড়ে
+│   Output: [{name: "nginx", url: "https://...", type: "rss"}, ...]
+│
+├─ Feed type অনুযায়ী collector select:
+│   "rss"                      → CollectRSSArticles
+│   "dependabot"               → CollectDependabotAlerts  
+│   "google-artifact-registry" → CollectGoogleArtifactRegistryAlerts
+│
+├─ প্রতিটা collector → feed entry objects return করে
+│   (RSSArticle, Dependabot, GoogleArtifactRegistry — সব Base-এর child)
+│
+└─ handle_announcement (প্রতিটা entry-র জন্য):
+    ├─ known? → Sheet-এ আগে থেকে আছে? → skip
+    ├─ 6 মাসের পুরনো? → skip
+    ├─ ignore? (alpha/beta/rc?) → skip notification, but still track
+    ├─ auto_jira_issue_create? → JIRA ticket
+    ├─ remember! → Sheet-এ save
+    └─ Notify → Slack message
+```
+
+---
+
+## Step 3: File-by-File Explanation
+
+---
+
+### 3.1 `bin/gulli` — Entry Point
+
+```ruby
+#!/usr/bin/env ruby
+```
+- **Shebang line** — Linux/Mac-এ বলে "Ruby দিয়ে চালাও"
+- Python-এ: `#!/usr/bin/env python3`
+
+```ruby
+$LOAD_PATH.unshift File.expand_path('../../lib', __FILE__)
+```
+- **`$LOAD_PATH`** = Ruby-র `sys.path` (Python)
+- এই line বলে: `lib/` folder-কে require path-এ add করো
+- `File.expand_path('../../lib', __FILE__)` → এই file (`bin/gulli`) থেকে 2 level উপরে গিয়ে `lib/` folder-এর absolute path বের করে
+- `unshift` = array-এর শুরুতে add করো (Python: `sys.path.insert(0, path)`)
+
+**Python equivalent:**
+```python
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'lib'))
+```
+
+```ruby
+require 'bundler/setup'
+```
+- **Bundler** = Ruby-র dependency manager (Python-এর `pip` + `virtualenv` এর মতো)
+- এটা `Gemfile`-এ listed gems-কে available করে
+- Python-এ: `venv` activate করার মতো
+
+```ruby
+require 'gulli'
+```
+- `lib/gulli.rb` load করে (কারণ `lib/` আগেই `$LOAD_PATH`-এ add হয়েছে)
+
+```ruby
+Gulli.run
+```
+- Main execution শুরু
+
+**Summary:** এই file শুধু setup করে আর `Gulli.run` call করে। 5 line-এর script।
+
+---
+
+### 3.2 `lib/gulli.rb` — Main Orchestration
+
+এটা সবচেয়ে গুরুত্বপূর্ণ file। ধাপে ধাপে বুঝি:
+
+#### Part A: Requires ও Registry
+
+```ruby
+require 'logger'
+require 'gulli/collect_rss_articles'
+require 'gulli/collect_dependabot_alerts'
+require 'gulli/collect_google_artifact_registry_alerts'
+```
+
+```ruby
+module Gulli
+  FEED_ENTRY_COLLECTOR = {
+    'rss' => Gulli::CollectRSSArticles,
+    'dependabot' => Gulli::CollectDependabotAlerts,
+    'google-artifact-registry' => Gulli::CollectGoogleArtifactRegistryAlerts,
+  }.freeze
+```
+
+এটা একটা **lookup table**। Feed-এর `type` field দেখে decide করে কোন class ব্যবহার হবে।
+
+**Python equivalent:**
+```python
+FEED_ENTRY_COLLECTOR = {
+    'rss': CollectRSSArticles,
+    'dependabot': CollectDependabotAlerts,
+    'google-artifact-registry': CollectGoogleArtifactRegistryAlerts,
+}
+```
+
+#### Part B: `self.run` — মূল execution
+
+```ruby
+def self.run
+  clear_cache!
+  announcements.each do |announcement|
+    handle_announcement(announcement)
+  end
+rescue StandardError => error
+  Gulli.logger.fatal error
+  Gulli::Notify.fatal "#{error.class} #{error}"
+end
+```
+
+- `def self.run` → **class-level method** (Python-এ `@staticmethod` বা `@classmethod`)
+- `clear_cache!` → আগের run-এর cached data মুছে ফেলো
+- `.each do |announcement|` → Python-এর `for announcement in announcements:`
+- `rescue` → Python-এর `except`। পুরো method-কে try-catch করে
+
+#### Part C: `self.feeds` ও `self.announcements`
+
+```ruby
+def self.feeds
+  feeds = Gulli::FetchFeeds.call
+  Gulli.logger.info "Got #{feeds.length} feeds"
+  feeds  # Ruby-তে last line automatically return হয়
+end
+```
+
+```ruby
+def self.announcements
+  feeds.each_with_object([]) do |feed, announcements|
+    collector = FEED_ENTRY_COLLECTOR[feed[:type]]
+    announcements.concat(collector.call(feed))
+  end
+end
+```
+
+**`each_with_object([])`** বুঝি:
+```python
+# Python equivalent:
+def announcements(cls):
+    result = []  # ← এই empty list টা হলো each_with_object([]) এর []
+    for feed in cls.feeds():
+        collector = FEED_ENTRY_COLLECTOR[feed['type']]
+        result.extend(collector.call(feed))  # concat = extend
+    return result
+```
+
+- `each_with_object([])` → একটা empty array নিয়ে শুরু করে, প্রতিটা iteration-এ সেটায় জমা করে, শেষে return করে
+- `feed[:type]` → `:type` হলো Ruby **Symbol** (হালকা string)। `feed['type']` ও লেখা যায়, কিন্তু Symbol convention
+
+#### Part D: `self.handle_announcement` — Decision Logic
+
+```ruby
+def self.handle_announcement(announcement)
+  if already_known_or_old?(announcement)
+    Gulli.logger.debug "Ignoring #{announcement.id} as we already know it"
+    return
+  end
+
+  if !announcement.ignore? && announcement.auto_jira_issue_create?
+    # announcement.create_jira_ticket!(article: announcement)  # commented = dry run
+    puts " [DRY RUN] Would create JIRA ticket for: #{announcement.title}"
+  end
+
+  # announcement.remember! unless announcement.published_date_before_6_months?
+  puts " [DRY RUN] Would UPDATE Google Sheet (mark as seen): #{announcement.id}"
+  
+  # Gulli::Notify.article(announcement) unless announcement.ignore?
+  puts " [DRY RUN] Would send SLACK notification for: #{announcement.title}"
+end
+```
+
+**Decision tree:**
+```
+announcement আসলো
+    │
+    ├── already known বা 6 মাস পুরনো? → SKIP (return)
+    │
+    ├── ignore না + auto jira on? → JIRA ticket তৈরি করো
+    │
+    ├── 6 মাসের পুরনো না? → Sheet-এ save করো
+    │
+    └── ignore না? → Slack notify করো
+```
+
+- `unless` = `if not` → `unless x` means `if !x`
+- Lines commented out with `#` = **DRY RUN mode** — কিছু লেখে না, শুধু print করে
+- `?` ending methods → boolean return করে (Ruby convention)
+- `!` ending methods → data modify করে (Ruby convention)
+
+#### Part E: Config Methods
+
+```ruby
+def self.config
+  @config ||= {
+    google: google_config,
+    spreadsheet: spreadsheet_config,
+    repo: repo_config,
+    slack: slack_config,
+    jira: jira_config,
+  }
+end
+```
+
+- **`||=` (memoization):** "যদি `@config` already set থাকে, ব্যবহার করো। না থাকলে এখন set করো।"
+
+```python
+# Python equivalent:
+@classmethod
+def config(cls):
+    if not hasattr(cls, '_config'):
+        cls._config = {
+            'google': cls.google_config(),
+            'spreadsheet': cls.spreadsheet_config(),
+            # ...
+        }
+    return cls._config
+```
+
+```ruby
+def self.google_config
+  { keyfile: ENV.fetch('GOOGLE_KEYFILE') }
+end
+```
+- `ENV.fetch('KEY')` → environment variable পড়ে। না পেলে **crash** করে
+- Python: `os.environ['KEY']`
+
+```ruby
+def self.repo_config
+  {
+    owner: ENV.fetch('GITHUB_REPO_OWNER', nil),
+    token: ENV.fetch('GITHUB_REPO_ACCESS_TOKEN', nil),
+  }
+end
+```
+- `ENV.fetch('KEY', nil)` → না পেলে `nil` (crash করে না)
+- Python: `os.environ.get('KEY')` বা `os.environ.get('KEY', None)`
+
+#### Part F: Logger ও Cache
+
+```ruby
+def self.logger
+  @logger = Logger.new($stdout)
+end
+```
+- `$stdout` = standard output (terminal)
+- **Note:** এখানে `||=` নেই, তাই প্রতিবার নতুন Logger তৈরি হয় (সম্ভবত minor bug, তবে কাজ করে)
+
+```ruby
+def self.cache
+  @cache ||= {}
+end
+
+def self.clear_cache!
+  @cache = {}
+end
+```
+- Module-level dictionary — Spreadsheet data cache করে যাতে বারবার API call না লাগে
+
+#### Part G: File শেষের requires
+
+```ruby
+require 'gulli/fetch_feeds'
+require 'gulli/notify'
+```
+- **শেষে কেন?** → Circular dependency avoid। `fetch_feeds` আর `notify` নিজেরা `Gulli.config` ব্যবহার করে, তাই `Gulli` module আগে define হতে হবে
+
+---
+
+### 3.3 `lib/gulli/spreadsheet.rb` — Google Sheets API
+
+এটা Google Sheet-এর সাথে কথা বলে।
+
+#### `get_values` — Sheet থেকে data পড়া
+
+```ruby
+def self.get_values(range)
+  cache_key = range_cache_key(range)
+  return Gulli.cache[cache_key] if Gulli.cache[cache_key]
+```
+- আগে cache check করো — আছে? তাহলে API call করো না
+
+```ruby
+  values = service.get_spreadsheet_values(spreadsheet_id, range).values
+  header = values.first.map(&:to_s)
+  values.drop(1).map { |row| Hash[header.zip(row)] }
+```
+
+ধরো Sheet-এ এই data আছে:
+```
+| Name  | URL          | Type |
+|-------|-------------|------|
+| nginx | https://... | rss  |
+| redis | https://... | rss  |
+```
+
+Step by step:
+```ruby
+values = [["Name", "URL", "Type"], ["nginx", "https://...", "rss"], ["redis", "https://...", "rss"]]
+
+header = values.first.map(&:to_s)
+# header = ["Name", "URL", "Type"]
+# .map(&:to_s) মানে প্রতিটায় .to_s() call করো (str() in Python)
+
+values.drop(1)
+# [["nginx", "https://...", "rss"], ["redis", "https://...", "rss"]]
+# .drop(1) = Python-এর [1:] (প্রথমটা বাদ)
+
+.map { |row| Hash[header.zip(row)] }
+# header.zip(row) = [["Name","nginx"], ["URL","https://..."], ["Type","rss"]]
+# Hash[...] = {"Name"=>"nginx", "URL"=>"https://...", "Type"=>"rss"}
+```
+
+**Python equivalent:**
+```python
+header = [str(h) for h in values[0]]
+rows = [dict(zip(header, row)) for row in values[1:]]
+```
+
+```ruby
+.tap do |rows|
+  Gulli.logger.debug "Caching for range #{range}"
+  Gulli.cache[cache_key] = rows
+end
+```
+- `.tap` → value-কে change না করে side effect করে (cache-এ save)
+- Python-এ `.tap` নেই, তুমি আলাদা line-এ cache save করতে
+
+#### `update` — Specific cell update
+
+```ruby
+def self.update(range, attributes:)
+  value_range = Google::Apis::SheetsV4::ValueRange.new(values: [attributes])
+  service.update_spreadsheet_value(spreadsheet_id, range, value_range, value_input_option: :raw)
+```
+- `attributes:` → **keyword argument** (Python-এও same)
+- `:raw` → data-কে as-is save করো, Google auto-format করবে না
+- Update-এর পরে cache invalidate: `Gulli.cache.delete range_cache_key(range)`
+
+#### `append` — নতুন row add
+
+```ruby
+def self.append(range, attributes:)
+```
+- `update`-এর মতোই কিন্তু `append_spreadsheet_value` use করে — নতুন row শেষে যোগ করে
+
+#### `service` — Google API Client setup
+
+```ruby
+def self.service
+  Gulli.cache[:spreadsheet_service] ||= begin
+    service = Google::Apis::SheetsV4::SheetsService.new
+    service.client_options.application_name = 'Auto GUL'
+    service.authorization = Google::Auth::ServiceAccountCredentials.make_creds(
+      json_key_io: File.open(Gulli.config[:google][:keyfile]),
+      scope: Google::Apis::SheetsV4::AUTH_SPREADSHEETS,
+    )
+    service
+  end
+end
+```
+
+- `begin...end` = multi-line block (Python-এ নেই, শুধু sequential code)
+- `||=` + `begin...end` = একবার create করে cache-এ রাখো
+- `json_key_io: File.open(...)` → **এটা তোমার keyfile.json** — service account credentials
+- `AUTH_SPREADSHEETS` → read+write permission scope
+
+**Python equivalent:**
+```python
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+creds = service_account.Credentials.from_service_account_file('keyfile.json', scopes=[...])
+service = build('sheets', 'v4', credentials=creds)
+```
+
+---
+
+### 3.4 `lib/gulli/fetch_feeds.rb` — Feed Config পড়া
+
+```ruby
+TRUE_VALUE = 'TRUE'.freeze
+FALSE_VALUE = 'FALSE'.freeze
+DEFAULT_FEED_TYPE = 'rss'.freeze
+```
+- Google Sheet TRUE/FALSE text হিসেবে store করে, তাই string comparison
+
+```ruby
+def self.call
+  new.call  # instance বানাও, তারপর instance method call করো
+end
+```
+- Common Ruby pattern: `ClassName.call` → `ClassName.new.call()`
+
+```ruby
+def feed_hash(row)
+  feed_type = row.fetch('Type', DEFAULT_FEED_TYPE) || DEFAULT_FEED_TYPE
+  {
+    name: row.fetch('Name'),
+    url: row.fetch('URL'),
+    ignore_updates: (row.fetch('Ignore Updates', false) == TRUE_VALUE),
+    type: feed_type.strip,
+    auto_jira_issue_create: (row.fetch("Don't Create Jira Issue", false) == FALSE_VALUE),
+    jira_ticket_assignee: row.fetch('story_assignee'),
+  }
+end
+```
+
+**গুরুত্বপূর্ণ — Double Negative Logic:**
+- Column name: "Don't Create Jira Issue"
+- Value: "FALSE" মানে "Don't create = FALSE" = **হ্যাঁ create করো**
+- তাই: `== FALSE_VALUE` check করলে `auto_jira_issue_create: true` হয়
+
+**Google Sheet Feeds tab এমন দেখায়:**
+
+| Name | URL | Type | Ignore Updates | Don't Create Jira Issue | story_assignee |
+|------|-----|------|---------------|------------------------|----------------|
+| nginx | https://nginx.org/feed.xml | rss | FALSE | FALSE | john123 |
+
+---
+
+### 3.5 `lib/gulli/notify.rb` — Slack Notification
+
+```ruby
+require 'slack-notifier'
+```
+
+#### `self.article` — নতুন vulnerability notification
+
+```ruby
+def self.article(article)
+  unless Gulli.config[:slack][:webhook_url]
+    Gulli.logger.info "No slack webhook URL configured - won't notify"
+    return
+  end
+```
+- Webhook URL না থাকলে silently skip — **তোমার জন্য ভালো, Slack setup না করলেও crash করবে না**
+
+```ruby
+  jira_issue_key = article.jira_ticket_link ? article.jira_ticket_link.split('/').last : nil
+```
+- `https://jira.com/browse/PROJ-123` → `PROJ-123`
+- Python: `article.jira_ticket_link.split('/')[-1] if article.jira_ticket_link else None`
+
+```ruby
+  notifier.ping "*#{article.feed}*:\n"\
+                "<#{article.url}|:inbox_tray: #{article.title}>\n"\ ...
+```
+- Slack Markdown: `*bold*`, `<url|text>` = clickable link, `:emoji:` = emoji
+
+#### Error notification methods:
+```ruby
+def self.feed_error(feed:, url:, error:)    # RSS feed error
+def self.repo_error(repo:, msg:)             # Generic repo error
+def self.dependabot_error(repo:, msg:)       # → calls repo_error
+def self.docker_error(repo:, msg:)           # → calls repo_error
+def self.fatal(error)                         # @channel mention — crash alert
+```
+
+---
+
+### 3.6 `lib/gulli/collect_rss_articles.rb` — RSS Collection
+
+```ruby
+def call
+  xml = fetch_xml          # HTTP GET → XML content
+  return [] unless xml     # error হলে empty array
+
+  feed = Feedjira.parse(xml)   # XML → parsed feed object
+  feed.entries.map do |entry|  # প্রতিটা entry → RSSArticle object
+    rss_article_object(entry)
+  end
+end
+```
+
+**`fetch_xml`:**
+```ruby
+def fetch_xml
+  client = HTTPClient.new
+  client.ssl_config.set_default_paths  # SSL fix (Ruby-র known issue)
+  client.get_content @url
+rescue HTTPClient::BadResponseError => error
+  # HTTP error (4xx, 5xx) → log + notify + return nil
+rescue => error
+  # অন্য যেকোনো error → log + notify + return nil
+end
+```
+
+- `rescue` without class name → catches all `StandardError` (Python-এর `except Exception:`)
+- Error হলে `nil` return → caller `return [] unless xml` দিয়ে handle করে
+
+---
+
+### 3.7 `lib/gulli/collect_dependabot_alerts.rb` — GitHub Dependabot
+
+```ruby
+def dependabot_alerts
+  response = HTTPClient.new.get(url, query_params, headers)
+  alerts = JSON.parse response.body
+  unless response.status == 200
+    notify_dependabot_error(alerts['message'])
+    return []
+  end
+  alerts
+end
+```
+- GitHub API call: `GET /repos/{owner}/{repo}/dependabot/alerts`
+- Bearer token auth
+- 200 না পেলে error handle
+
+```ruby
+def headers
+  {
+    Accept: 'application/vnd.github+json',
+    Authorization: "Bearer #{Gulli.config[:repo][:token]}",
+    'X-GitHub-Api-Version': '2022-11-28',
+  }
+end
+```
+
+---
+
+### 3.8 `lib/gulli/collect_google_artifact_registry_alerts.rb` — GAR
+
+```ruby
+def parse_and_filter_image_data
+  data = fetch_image_data                          # API call
+  return [] unless valid_image_data?(data)         # valid response?
+  
+  digest, info = find_latest_image(data['manifest'])  # "latest" tag খোঁজো
+  return [] unless digest && info
+  
+  build_alert_entry(digest, info)                  # alert object বানাও
+end
+```
+
+```ruby
+def find_latest_image(manifests)
+  manifests.detect { |_, m| m['tag'].include?('latest') }
+end
+```
+- `detect` = Python-এর `next((k,v) for k,v in manifests.items() if 'latest' in v['tag'])`
+- `|_, m|` → `_` = key (ignore), `m` = value
+
+```ruby
+def fetch_google_access_token
+  authorizer = Google::Auth::ServiceAccountCredentials.make_creds(
+    json_key_io: File.open(Gulli.config[:google][:keyfile]),
+    scope: scope,
+  )
+  authorizer.fetch_access_token!['access_token']
+end
+```
+- **তোমার keyfile.json** এখানে ব্যবহার হয় — OAuth2 access token নেয়
+
+---
+
+### 3.9 `lib/gulli/feed_entry/base.rb` — Base Class
+
+সব feed entry-র parent। **Core methods:**
+
+#### `known?` — Sheet-এ আছে কিনা
+
+```ruby
+def known?
+  Gulli::Spreadsheet.get_values(...).each_with_index do |row, index|
+    return row['id'] == id if ignore_updates     # ignore_updates হলে শুধু ID match
+    if row['id'] == id
+      last_updated = row['last_updated']
+      return true if last_updated == date         # date match → known
+      if last_updated.nil? || last_updated.empty?
+        update!((index + 2).to_s, date)           # empty → update করো
+        return true
+      end
+    end
+  end
+  false  # কোনো match পাইনি → unknown (নতুন)
+end
+```
+
+**`index + 2` কেন?**
+- `index` 0-based
+- Sheet-এর row 1 = header
+- তাই data row 0 = Sheet row 2
+
+#### `ignore?` — Pre-release filter
+
+```ruby
+IGNORE_REGEXP = /([.-]rc|alpha|beta|nightly|preview|snapshot|[.-]test)/i.freeze
+
+def ignore?
+  !!(title =~ IGNORE_REGEXP)
+end
+```
+- `=~` → regex match (Python: `re.search()`)
+- `!!` → force boolean (`!!nil` = `false`, `!!0` = `true`, `!!5` = `true`)
+- "nginx-1.25.0-rc1" → `ignore? = true`
+- "nginx-1.25.0" → `ignore? = false`
+
+#### `remember!` — Sheet-এ save
+
+```ruby
+def remember!
+  Gulli::Spreadsheet.append(
+    Gulli.config[:spreadsheet][:ranges][:data],
+    attributes: [feed, id, identifier, url, ignore?, date, jira_ticket_link],
+  )
+end
+```
+- Data tab-এ নতুন row: `[feed_name, unique_id, cve_id, url, true/false, date, jira_link]`
+
+---
+
+### 3.10 `lib/gulli/feed_entry/dependabot.rb` — Dependabot Entry
+
+```ruby
+class Dependabot < Base  # Base-এর child (inheritance)
+  def id
+    "#{feed}-#{entry['number']}"  # e.g., "my-repo-42"
+  end
+
+  def identifier
+    cve_id || ghsa_id  # CVE prefer, fallback GHSA
+  end
+
+  def ignore?
+    false  # Security alerts NEVER ignored (Base-এর regex override)
+  end
+end
+```
+
+---
+
+### 3.11 `lib/gulli/jira_ticket_creator.rb` — JIRA Integration
+
+```ruby
+include ::Utility::AssessmentDueDateGenerator
+```
+- **`include`** = mixin (Python-এর multiple inheritance এর মতো)
+- `AssessmentDueDateGenerator`-এর methods এই class-এও available হয়ে যায়
+
+```ruby
+JIRA_FIELD_FEED = 'customfield_11488'.freeze
+JIRA_FIELD_URL = 'customfield_11489'.freeze
+```
+- JIRA custom fields — প্রতিটা JIRA instance-এ custom field-এর ID আলাদা
+
+```ruby
+def call
+  response = http_client.post("#{jira_base_url}/rest/api/3/issue?skipAutoWatch=true", payload.to_json)
+  if response.status == 201
+    result = JSON.parse(response.body)
+    "#{jira_base_url}/browse/#{result['key']}"  # e.g., "https://jira.com/browse/PROJ-123"
+  else
+    Gulli::Notify.fatal(...)
+    nil
+  end
+end
+```
+- JIRA REST API v3 call
+- Success → ticket URL return
+- Failure → Slack-এ alert পাঠায়, `nil` return
+
+```ruby
+def auth_token
+  @auth_token ||= Base64.strict_encode64("#{jira_username}:#{jira_api_token}")
+end
+```
+- JIRA Basic Auth: `base64(username:api_token)`
+- Python: `base64.b64encode(f"{username}:{token}".encode()).decode()`
+
+**⚠️ payload-এ একটা bug/issue আছে:**
+```ruby
+JIRA_ASSESSMENT_DUE_DATE => assessment_due_date,
+```
+এখানে `JIRA_ASSESSMENT_DUE_DATE` constant-এর **value** (`'customfield_11856'`) key হিসেবে use হওয়া উচিত, কিন্তু code-এ constant **name** টা key হয়ে যাচ্ছে। সম্ভবত এটা কাজ করছে কারণ Ruby hash-এ constant evaluate হয়ে value হয়ে যায়।
+
+---
+
+### 3.12 `lib/utility/assessment_due_date_generator.rb` — Due Date
+
+```ruby
+module Utility
+  module AssessmentDueDateGenerator
+    DHAKA_OFFSET = '+06:00'.freeze
+    CUTOFF_HOUR = 10
+```
+
+```ruby
+    def assessment_due_date
+      today = Time.now.localtime(DHAKA_OFFSET)   # Dhaka timezone-এ current time
+      date = Date.new(today.year, today.month, today.day)
+      cutoff_time = Time.new(..., CUTOFF_HOUR, ...)
+      
+      due_date = if today < cutoff_time
+                   date                  # সকাল 10টার আগে → আজকে
+                 else
+                   next_day = date + 1   # 10টার পরে → আগামীকাল
+                   next_day += 1 if next_day.saturday?  # শনিবার? → রবিবার
+                   next_day
+                 end
+      due_date.strftime('%Y-%m-%d')      # "2024-01-15" format
+    end
+```
+
+**Rules:**
+1. সকাল 10টা (BD time) এর আগে → আজকের date
+2. 10টার পরে → আগামীকালের date
+3. আগামীকাল শনিবার? → রবিবার দাও
+
+**Python equivalent:**
+```python
+from datetime import datetime, timedelta
+import pytz
+
+def assessment_due_date(self):
+    dhaka = pytz.timezone('Asia/Dhaka')
+    now = datetime.now(dhaka)
+    if now.hour < 10:
+        due = now.date()
+    else:
+        due = now.date() + timedelta(days=1)
+        if due.weekday() == 5:  # Saturday
+            due += timedelta(days=1)
+    return due.strftime('%Y-%m-%d')
+```
+
+---
+
+### 3.13 `.env.example` — Environment Variables
+
+```
+SPREADSHEET_ID=1sgXVRgdLHogv7UX9G3RaHwlZvVhGOAMtSUluWPZ0jOA
+SPREADSHEET_RANGES_FEEDS=Feeds!A:D
+SPREADSHEET_RANGES_DATA=Data!A:G
+SPREADSHEET_UPDATE_SHEET=Data!
+SPREADSHEET_UPDATE_COLUMN=F
+```
+
+**Sheet Range Format:**
+- `Feeds!A:D` → "Feeds" নামের tab-এর column A থেকে D পর্যন্ত
+- `Data!A:G` → "Data" নামের tab-এর column A থেকে G পর্যন্ত
+- `Data!` → update-এর জন্য sheet name prefix
+- `F` → update column (last_updated column)
+
+**⚠️ Important:** `.env.example`-এ `GOOGLE_KEYFILE` নেই! তোমাকে `.env` ফাইলে add করতে হবে:
+```
+GOOGLE_KEYFILE=./keyfile.json
+```
+
+---
+
+### 3.14 `Gemfile` — Dependencies
+
+```ruby
+gem 'feedjira', '~> 3.2'        # RSS/Atom feed parser (Python-এর feedparser)
+gem 'google-api-client', '~> 0.53.0'  # Google APIs (Sheets)
+gem 'slack-notifier'             # Slack webhook
+gem 'httpclient'                 # HTTP requests (Python-এর requests)
+
+# Dev/Test only:
+gem 'dotenv'                     # .env file loader (Python-এর python-dotenv)
+gem 'rspec'                      # Testing framework (Python-এর pytest)
+gem 'timecop'                    # Time mocking for tests
+```
+
+- `~>` = **pessimistic version constraint**: `~> 3.2` মানে `>= 3.2` এবং `< 4.0`
+- `group :development, :test` → production-এ install হবে না
+
+---
+
+### 3.15 `dry_run_patch.rb` — Empty file (ignore)
+
+---
+
+## Step 4: Google Sheet Structure
+
+তোমাকে নিজের Google Sheet-এ **2টা tab** বানাতে হবে:
+
+### Tab 1: "Feeds" (input — কী monitor করবে)
+| Name | URL | Type | Ignore Updates | Don't Create Jira Issue | story_assignee |
+|------|-----|------|---------------|------------------------|----------------|
+| nginx | https://nginx.org/en/security_advisories.html | rss | FALSE | FALSE | (blank) |
+
+### Tab 2: "Data" (output — কী দেখা হয়েছে)
+| feed | id | identifier | url | ignore | last_updated | jira_ticket_link |
+|------|----|-----------|-----|--------|-------------|-----------------|
+| (Gulli fills this) | | | | | | |
+
+---
+
+## Step 5: Locally চালানোর Guide
+
+```bash
+# 1. Ruby install (rbenv recommended)
+brew install rbenv ruby-build    # Mac
+rbenv install 3.2.0              # or whatever version
+rbenv local 3.2.0
+
+# 2. Dependencies install
+gem install bundler
+bundle install
+
+# 3. .env file তৈরি করো (project root-এ)
+cp .env.example .env
+# .env edit করো:
+```
+
+**.env file:**
+```
+GOOGLE_KEYFILE=./keyfile.json
+SPREADSHEET_ID=তোমার_sheet_id
+SPREADSHEET_RANGES_FEEDS=Feeds!A:F
+SPREADSHEET_RANGES_DATA=Data!A:G
+SPREADSHEET_UPDATE_SHEET=Data!
+SPREADSHEET_UPDATE_COLUMN=F
+SLACK_WEBHOOK_URL=
+SLACK_CHANNEL=
+SLACK_USERNAME=gulli
+SLACK_ICON=robot_face
+GITHUB_REPO_OWNER=
+GITHUB_REPO_ACCESS_TOKEN=
+JIRA_BASE_URL=
+JIRA_PROJECT_KEY=
+JIRA_ISSUE_TYPE=
+JIRA_USERNAME=
+JIRA_API_TOKEN=
+JIRA_PROJECT_NAME=
+```
+
+```bash
+# 4. keyfile.json project root-এ রাখো
+
+# 5. Google Sheet-এ service account-এর email share করো
+#    (keyfile.json-এ "client_email" field দেখো)
+
+# 6. Run!
+bundle exec ruby bin/gulli
+```
+
+**⚠️ Slack/JIRA ছাড়া চালাতে:**
+- Current code-এ `handle_announcement`-এর actual calls already commented out (DRY RUN mode)
+- Slack webhook URL empty রাখলে `Notify.article` automatically skip করে
+- কিন্তু `Notify.feed_error` ও `Notify.fatal` crash করতে পারে — যদি হয়, আমাকে বলো, comment out করে দেবো
+
+---
+
+## Step 6: Missing Files
+
+আমার এখনো দরকার:
+
+1. **`lib/gulli/feed_entry/rss_article.rb`** — RSS entry class
+2. **`lib/gulli/feed_entry/google_artifact_registry.rb`** — GAR entry class
+3. **`spec/`** files — tests (optional, কিন্তু code বোঝার জন্য helpful)
+
+এই 2টা file পাঠালে context01.md 100% complete হবে।
+
+### 9. lib/gulli/feed_entry/rss_article.rb
+- **Purpose:** RSS/Atom feed entry-র wrapper — Base class extend করে
+- **Dependencies:** gulli/feed_entry/base
+- **Inherits:** FeedEntry::Base
+- **Key Methods:**
+  - `id` — Feedjira entry-র built-in ID (usually RSS guid/Atom id)
+  - `url` — Entry-র URL
+  - `date` — Updated date prefer করে, fallback published date। `.to_s` দিয়ে string-এ convert
+  - `title` — Entry title থেকে feed name remove করে (regex gsub)। Example: "nginx - Security Advisory" → feed="nginx" → "- Security Advisory" → strip → "- Security Advisory"
+  - `identifier` — title-ই identifier হিসেবে use হয়
+- **Note:** `ignore?` override করে না — Base class-এর regex check (alpha/beta/rc filter) ব্যবহার হয়
+- **Python equivalent:**
+  ```python
+  class RSSArticle(Base):
+      @property
+      def id(self):
+          return self.entry.id
+      
+      @property
+      def date(self):
+          if self.entry.updated:
+              return str(self.entry.updated)
+          elif self.entry.published:
+              return str(self.entry.published)
+          return None
+      
+      @property
+      def title(self):
+          import re
+          return re.sub(self.feed, '', self.entry.title, flags=re.IGNORECASE).strip()
+  ```
+
+### 10. lib/gulli/feed_entry/google_artifact_registry.rb
+- **Purpose:** Google Artifact Registry (Docker image) entry — Base class extend করে
+- **Dependencies:** gulli/feed_entry/base, uri
+- **Inherits:** FeedEntry::Base
+- **Key Methods:**
+  - `id` — "{feed_name}-{image_digest}"
+  - `url` — Parsed marketplace URL (collector-এ generate হয়)
+  - `title` — "Docker Image Alert: {feed} - {image_digest}"
+  - `summary` — Human readable description with upload time
+  - `identifier` — Image digest
+  - `date` — Upload timestamp
+  - `ignore?` — **Override!** `@ignore_updates` return করে (Base-এর regex check না করে feed config-এর setting follow করে)
+- **Note:** `entry` হলো collector-এ `build_alert_entry` দিয়ে বানানো hash:
+  ```ruby
+  {'image' => 'sha256:abc...', 'uploaded_at' => '2024-01-15 10:30:00 UTC', 'url' => 'gcr.io/project/image'}
+  ```
+
+### 11. lib/gulli/jira_ticket_creator.rb
+- **Purpose:** JIRA REST API v3 দিয়ে vulnerability assessment ticket create করে
+- **Dependencies:** utility/assessment_due_date_generator, httpclient, json, base64
+- **Mixin:** includes Utility::AssessmentDueDateGenerator (assessment_due_date method পায়)
+- **Custom Fields:** JIRA_FIELD_FEED (customfield_11488), JIRA_FIELD_URL (customfield_11489), JIRA_FIELD_PROJECT_NAME (customfield_11490), JIRA_ASSESSMENT_DUE_DATE (customfield_11856)
+- **Key Methods:**
+  - `self.call(article:)` — Class method → instance → call
+  - `call` — POST /rest/api/3/issue → success: ticket URL return, failure: Slack notify + nil
+  - `payload` — JIRA issue fields hash (project, reporter, summary, type, assignee, custom fields)
+  - `http_client` — Memoized HTTPClient with Basic Auth header
+  - `auth_token` — Base64(username:api_token)
+- **Auth:** Basic Auth with JIRA API token
+- **Returns:** Ticket URL string (e.g., "https://jira.com/browse/PROJ-123") or nil on failure
+- **Error Handling:** Both HTTP error response and exception → Slack fatal notify with "[Action Required]" prefix
+
+### 12. lib/utility/assessment_due_date_generator.rb
+- **Purpose:** JIRA ticket-এর assessment due date calculate করে (Bangladesh timezone)
+- **Dependencies:** date
+- **Type:** Module (mixin) — JiraTicketCreator-এ include হয়
+- **Rules:**
+  1. সকাল 10:00 AM BD time (UTC+6) এর আগে → আজকের date
+  2. 10:00 AM এর পরে → আগামীকালের date
+  3. আগামীকাল শনিবার হলে → রবিবার
+- **Returns:** "YYYY-MM-DD" format string
+
+### 13. bin/gulli
+- **Purpose:** Entry point script — application চালায়
+- **What it does:**
+  1. `lib/` folder-কে `$LOAD_PATH`-এ add করে
+  2. Bundler setup (gem dependencies load)
+  3. `require 'gulli'` (main module load)
+  4. `Gulli.run` (execution start)
+
+### 14. dry_run_patch.rb
+- **Purpose:** Local testing safety — currently empty file
+- **Note:** gulli.rb-এর handle_announcement-এ actual calls already commented out
+
+### 15. .env.example
+- **Purpose:** Environment variable reference
+- **Missing from example:** `GOOGLE_KEYFILE` (must add to .env)
+- **Sheet ranges:** `Feeds!A:D` (feeds tab, cols A-D), `Data!A:G` (data tab, cols A-G)
+- **Note:** SLACK_WEBHOOK_URL empty রাখলে notifications skip হয়
+
+### 16. Gemfile
+- **Purpose:** Ruby dependency declaration (Python-এর requirements.txt)
+- **Key Dependencies:**
+  - feedjira ~> 3.2 — RSS/Atom parser (≈ Python feedparser)
+  - google-api-client ~> 0.53.0 — Google Sheets API
+  - slack-notifier — Slack webhook
+  - httpclient — HTTP requests (≈ Python requests)
+  - dotenv (dev) — .env file loader (≈ Python python-dotenv)
+  - rspec (dev) — Testing (≈ Python pytest)
+  - timecop (dev) — Time mocking for tests
+
+## Inheritance Map (Feed Entry Classes)
+
+```
+FeedEntry::Base (abstract-like parent)
+├── known?()              — Sheet-এ আছে কিনা check
+├── remember!()           — Sheet-এ save
+├── ignore?()             — regex: alpha/beta/rc filter
+├── auto_jira_issue_create?()
+├── published_date_before_6_months?()
+├── update!()
+└── create_jira_ticket!()
+
+FeedEntry::RSSArticle < Base
+├── id        → entry.id (Feedjira)
+├── url       → entry.url
+├── date      → entry.updated || entry.published
+├── title     → entry.title minus feed name
+├── identifier → title
+└── ignore?   → (inherits Base regex check)
+
+FeedEntry::Dependabot < Base
+├── id        → "{feed}-{alert_number}"
+├── url       → GitHub HTML URL
+├── date      → updated_at
+├── title     → "{CVE/GHSA} - {summary}"
+├── identifier → cve_id || ghsa_id
+└── ignore?   → always false (override)
+
+FeedEntry::GoogleArtifactRegistry < Base
+├── id        → "{feed}-{image_digest}"
+├── url       → marketplace URL
+├── date      → uploaded_at
+├── title     → "Docker Image Alert: ..."
+├── identifier → image digest
+└── ignore?   → @ignore_updates (override — uses feed config)
+```
+
+## Complete Data Flow (Detailed)
+
+```
+1. bin/gulli → Gulli.run
+2. Gulli.clear_cache!
+3. Gulli.feeds → FetchFeeds.call
+   └── Spreadsheet.get_values("Feeds!A:D")
+       └── Google Sheets API → [{name:"nginx", url:"...", type:"rss"}, ...]
+4. Gulli.announcements → for each feed:
+   └── FEED_ENTRY_COLLECTOR[type].call(feed)
+       ├── type="rss" → CollectRSSArticles
+       │   └── HTTPClient.get(url) → Feedjira.parse(xml) → [RSSArticle, ...]
+       ├── type="dependabot" → CollectDependabotAlerts
+       │   └── GitHub API GET → [Dependabot, ...]
+       └── type="google-artifact-registry" → CollectGoogleArtifactRegistryAlerts
+           └── Google API GET (OAuth2) → [GoogleArtifactRegistry, ...]
+5. For each announcement:
+   ├── known? → Spreadsheet.get_values("Data!A:G") → check if ID exists
+   ├── published_date_before_6_months? → DateTime check
+   ├── ignore? → regex/override check
+   ├── create_jira_ticket! → JIRA REST API POST (if enabled)
+   ├── remember! → Spreadsheet.append("Data!A:G", [...])
+   └── Notify.article → Slack webhook POST
+```
+
+## Potential Issues When Running Locally
+1. **GOOGLE_KEYFILE missing from .env.example** — must add manually
+2. **SPREADSHEET_RANGES_FEEDS=Feeds!A:D** but feed_hash expects 6 columns (Name, URL, Type, Ignore Updates, Don't Create Jira Issue, story_assignee) — may need `Feeds!A:F`
+3. **Slack/JIRA calls in error paths** — Notify.feed_error, Notify.fatal may crash if webhook_url is nil (notifier initialization will fail)
+4. **handle_announcement currently in DRY RUN** — actual Sheet writes and Slack/JIRA calls commented out
+
+
+
+
+## Spec Files (Tests)
+
+### spec/spec_helper.rb
+- **Purpose:** Test environment setup — fake ENV variables set করে
+- **Note:** `SPREADSHEET_RANGES_DATA = 'Data!A:E'` (5 cols) but .env.example has `Data!A:G` (7 cols) — spec may be outdated
+- **Pattern:** Real APIs never called in tests — everything mocked
+
+### spec/gulli_spec.rb
+- **Purpose:** Main orchestration logic test — Gulli.run-এর behavior verify
+- **Key Test Cases:**
+  1. **Cache reset** — run() চালালে cache clear হয়
+  2. **Core business logic** (3 articles):
+     - known article → skip completely (no remember, no notify, no jira)
+     - unknown + ignored → remember (save to sheet) but NO notify
+     - unknown + not ignored → remember + notify
+  3. **Error handling** — exception → Slack fatal notification
+  4. **JIRA creation** — auto_jira_issue_create=true + unknown + not ignored → create ticket
+- **Testing Pattern:** instance_double (mock objects), allow/expect (stub/verify)
+- **Python equivalent:** unittest.mock.MagicMock + @patch
+
+### spec/gulli/collect_google_artifact_registry_alerts_spec.rb
+- **Purpose:** GAR collector tests
+- **Mock data reveals API response format:**
+  ```json
+  {
+    "manifest": {
+      "sha256:deadbeef": {
+        "tag": ["latest"],
+        "timeUploadedMs": "1705312200000"
+      }
+    }
+  }
+  ```
+- **Test Cases:**
+  1. HTTP error → raises error + Slack docker_error notify
+  2. Missing google config → empty array + Slack notify
+
+### spec/gulli/feed_entry/rss_article_spec.rb
+- **Purpose:** RSSArticle class tests
+- **Uses OpenStruct** to mock Feedjira entry
+- **Verifies:** id, url, title, identifier, ignore? methods
+
+## Business Rules (confirmed by tests)
+
+```
+┌─────────────────────────────────────────────────────┐
+│              Gulli Decision Matrix                   │
+├──────────┬─────────┬──────────┬───────┬─────────────┤
+│ known?   │ ignore? │ jira_on? │ Sheet │ Slack │ JIRA │
+├──────────┼─────────┼──────────┼───────┼───────┼──────┤
+│ true     │ any     │ any      │ ❌    │ ❌    │ ❌   │
+│ false    │ true    │ any      │ ✅    │ ❌    │ ❌   │
+│ false    │ false   │ false    │ ✅    │ ✅    │ ❌   │
+│ false    │ false   │ true     │ ✅    │ ✅    │ ✅   │
+│ old(>6m) │ any     │ any      │ ❌    │ ❌    │ ❌   │
+└──────────┴─────────┴──────────┴───────┴───────┴──────┘
+```
+
+## Ruby Testing Concepts → Python Mapping
+
+| Ruby (RSpec)                              | Python (pytest/unittest)                    |
+|------------------------------------------|---------------------------------------------|
+| `RSpec.describe ClassName do`            | `class TestClassName(unittest.TestCase):`   |
+| `it 'does something' do`                | `def test_does_something(self):`            |
+| `let(:var) { value }`                    | `setUp()` or `@pytest.fixture`             |
+| `before do`                              | `setUp()` or `@patch` decorator            |
+| `expect(x).to eq(y)`                    | `self.assertEqual(x, y)`                   |
+| `expect(x).to receive(:method)`         | `mock.assert_called()` or `@patch`         |
+| `allow(x).to receive(:m).and_return(v)` | `x.m = MagicMock(return_value=v)`          |
+| `instance_double(Class)`                | `MagicMock(spec=Class)`                    |
+| `context 'when...' do`                  | Nested class or separate test method       |
+| `and_raise('error')`                    | `side_effect=Exception('error')`           |
+
+## Codebase Understanding: COMPLETE ✅
+
+All production files analyzed:
+- [x] lib/gulli.rb
+- [x] lib/gulli/spreadsheet.rb
+- [x] lib/gulli/fetch_feeds.rb
+- [x] lib/gulli/notify.rb
+- [x] lib/gulli/collect_rss_articles.rb
+- [x] lib/gulli/collect_dependabot_alerts.rb
+- [x] lib/gulli/collect_google_artifact_registry_alerts.rb
+- [x] lib/gulli/feed_entry/base.rb
+- [x] lib/gulli/feed_entry/rss_article.rb
+- [x] lib/gulli/feed_entry/dependabot.rb
+- [x] lib/gulli/feed_entry/google_artifact_registry.rb
+- [x] lib/gulli/jira_ticket_creator.rb
+- [x] lib/utility/assessment_due_date_generator.rb
+- [x] bin/gulli
+- [x] dry_run_patch.rb (empty)
+- [x] .env.example
+- [x] Gemfile + Gemfile.lock
+
+All spec files analyzed:
+- [x] spec/spec_helper.rb
+- [x] spec/gulli_spec.rb
+- [x] spec/gulli/collect_google_artifact_registry_alerts_spec.rb
+- [x] spec/gulli/feed_entry/rss_article_spec.rb
+- [ ] base_spec.rb — does not exist (confirmed)
+
+
+
+
+
+
+
+
+
+this is what is inside the context01.md
+
+but can you give me line by line expalanation along with which one is function for me to identify easily, which one is class and what is what and what is doing what and how is everything working here?
+
+
+
+
+
+
+
+
+
+
+# Gulli বোঝা — সহজ বাংলায়, ধাপে ধাপে
+
+তোমার confusion কোথায় সেটা আমি guess করে explain করি। তুমি Python জানো, তাই Ruby-র কিছু concept তোমাকে আটকাচ্ছে। চলো একদম basic থেকে শুরু করি।
+
+---
+
+## প্রথমে বুঝো: Ruby আর Python-এর মূল পার্থক্যগুলো
+
+### পার্থক্য ১: `module` কী জিনিস?
+
+Python-এ তুমি জানো `class` আর `function`। Ruby-তে আরেকটা জিনিস আছে — `module`।
+
+```ruby
+module Gulli
+  # ভিতরে code
+end
+```
+
+**সহজ ভাষায়:** `module` হলো একটা **ফোল্ডার/বাক্স** — যেটা related জিনিসপত্র একসাথে রাখে।
+
+Python-এ তুমি যখন একটা folder বানাও `gulli/` নামে আর ভিতরে `__init__.py` রাখো — সেটাই Ruby-র `module`।
+
+```python
+# Python-এ module মানে basically:
+# gulli/ folder + __init__.py
+# অথবা ভাবো একটা container class যেটার instance বানানো হয় না:
+
+class Gulli:  # শুধু namespace হিসেবে ব্যবহার
+    @staticmethod
+    def run():
+        pass
+```
+
+**মনে রাখো:** Ruby-র `module` = **শুধু একটা নামের বাক্স** যেটার ভিতরে class, method, constant রাখা যায়।
+
+---
+
+### পার্থক্য ২: `def self.method` vs `def method`
+
+এটা অনেককে confuse করে। চলো পরিষ্কার করি:
+
+```ruby
+module Gulli
+  def self.run        # ← self. আছে
+    puts "running"
+  end
+end
+
+# Call: Gulli.run
+```
+
+```ruby
+class Dog
+  def bark            # ← self. নেই
+    puts "woof"
+  end
+end
+
+# Call: dog = Dog.new; dog.bark
+```
+
+**নিয়ম:**
+- `def self.method` → **object না বানিয়েই call করা যায়**: `Gulli.run`
+- `def method` → **আগে object বানাতে হয়**: `dog = Dog.new` তারপর `dog.bark`
+
+**Python-এ:**
+```python
+class Gulli:
+    @staticmethod        # ← def self.method এর মতো
+    def run():
+        print("running")
+
+class Dog:
+    def bark(self):      # ← def method এর মতো
+        print("woof")
+
+# Call:
+Gulli.run()              # object ছাড়া
+dog = Dog()
+dog.bark()               # object লাগে
+```
+
+---
+
+### পার্থক্য ৩: `@variable` কী?
+
+```ruby
+class Dog
+  def initialize(name)
+    @name = name         # @ মানে "এই object-এর নিজস্ব variable"
+  end
+
+  def speak
+    puts "I am #{@name}"
+  end
+end
+
+dog = Dog.new("Tommy")
+dog.speak  # → "I am Tommy"
+```
+
+**Python-এ:**
+```python
+class Dog:
+    def __init__(self, name):
+        self.name = name     # self.name = Ruby-র @name
+
+    def speak(self):
+        print(f"I am {self.name}")
+```
+
+**মনে রাখো:** Ruby-র `@name` = Python-এর `self.name`
+
+---
+
+### পার্থক্য ৪: `attr_reader` কী?
+
+```ruby
+class Dog
+  attr_reader :name    # ← এটা automatically একটা method বানায়
+
+  def initialize(name)
+    @name = name
+  end
+end
+
+dog = Dog.new("Tommy")
+puts dog.name  # → "Tommy"  ← attr_reader ছাড়া এটা কাজ করতো না
+```
+
+`attr_reader :name` আসলে secretly এই method বানায়:
+```ruby
+def name
+  @name
+end
+```
+
+**Python-এ:**
+```python
+class Dog:
+    def __init__(self, name):
+        self.name = name    # Python-এ automatically accessible
+        # Python-এ attr_reader দরকার নেই — self.name করলেই হয়
+```
+
+**মনে রাখো:** Ruby-তে `@name` private — বাইরে থেকে access করতে `attr_reader` লাগে। Python-এ `self.name` automatically public।
+
+---
+
+### পার্থক্য ৫: Symbol (`:name`) কী?
+
+```ruby
+feed = { name: "nginx", url: "https://..." }
+puts feed[:name]  # → "nginx"
+```
+
+`:name` হলো **Symbol** — হালকা string। Python-এ directly এটা নেই, তবে:
+
+```python
+# Python-এ string key ব্যবহার করো:
+feed = {"name": "nginx", "url": "https://..."}
+print(feed["name"])
+```
+
+**মনে রাখো:** Ruby-র `:name` = Python-র `"name"` — শুধু syntax আলাদা। Ruby-তে hash key হিসেবে Symbol ব্যবহার common।
+
+---
+
+### পার্থক্য ৬: Block (`do...end` বা `{ }`)
+
+এটা Python-এ নেই, তাই সবচেয়ে confusing হতে পারে।
+
+```ruby
+[1, 2, 3].each do |number|
+  puts number
+end
+```
+
+**Python-এ:**
+```python
+for number in [1, 2, 3]:
+    print(number)
+```
+
+আরেকটা example:
+```ruby
+[1, 2, 3].map { |n| n * 2 }
+# Result: [2, 4, 6]
+```
+
+**Python-এ:**
+```python
+[n * 2 for n in [1, 2, 3]]
+# Result: [2, 4, 6]
+```
+
+**মনে রাখো:**
+- `do |variable| ... end` = Python-এর `for variable in ...:` (বড় block)
+- `{ |variable| expression }` = Python-এর list comprehension (ছোট block)
+- `|variable|` = block-এর parameter — Python-এর loop variable
+
+---
+
+### পার্থক্য ৭: `||=` কী?
+
+```ruby
+@config ||= { name: "gulli" }
+```
+
+**মানে:** "@config যদি nil (empty/unset) হয়, তাহলে set করো। already set থাকলে কিছু করো না।"
+
+**Python-এ:**
+```python
+if not hasattr(self, '_config') or self._config is None:
+    self._config = {"name": "gulli"}
+```
+
+অথবা সহজে:
+```python
+# প্রথমবার call-এ calculate করো, পরেরবার cached value দাও
+if self._config is None:
+    self._config = {"name": "gulli"}
+return self._config
+```
+
+**কেন দরকার?** ধরো `config` method প্রতিবার call হয়। প্রতিবার নতুন dictionary বানানো waste। `||=` দিয়ে একবার বানিয়ে রাখো, পরে reuse করো।
+
+---
+
+### পার্থক্য ৮: `unless` কী?
+
+```ruby
+return unless xml   # xml nil হলে return করো
+```
+
+`unless` = `if not`
+
+**Python-এ:**
+```python
+if not xml:
+    return
+```
+
+অথবা:
+```ruby
+# Ruby
+puts "hello" unless sleeping?
+
+# Python
+if not sleeping():
+    print("hello")
+```
+
+---
+
+### পার্থক্য ৯: Last line = automatic return
+
+```ruby
+def add(a, b)
+  a + b          # ← এটাই return হবে, return keyword লাগে না
+end
+```
+
+**Python-এ:**
+```python
+def add(a, b):
+    return a + b   # ← return লিখতেই হবে
+```
+
+**মনে রাখো:** Ruby-তে method-এর **শেষ line-এর value automatically return** হয়।
+
+---
+
+### পার্থক্য ১০: `rescue` কী?
+
+```ruby
+def risky_work
+  # কিছু কাজ
+  result = 10 / 0
+rescue StandardError => error
+  puts "Error হয়েছে: #{error}"
+end
+```
+
+**Python-এ:**
+```python
+def risky_work():
+    try:
+        result = 10 / 0
+    except Exception as error:
+        print(f"Error হয়েছে: {error}")
+```
+
+**মনে রাখো:** `rescue` = `except`, `StandardError` = `Exception`
+
+---
+
+## এখন Gulli বুঝি — সহজ বাংলায়
+
+সব syntax পরিষ্কার হওয়ার পর, চলো Gulli কী করে সেটা গল্পের মতো বুঝি।
+
+### গল্প: Gulli কী করে?
+
+**ধরো তুমি একটা কোম্পানিতে কাজ করো।** তোমার কোম্পানি অনেক software ব্যবহার করে — nginx, redis, postgres ইত্যাদি। এগুলোতে security vulnerability পাওয়া গেলে তোমাকে জানতে হবে।
+
+**সমস্যা:** প্রতিদিন ১০০টা software-এর vulnerability manually check করা অসম্ভব।
+
+**সমাধান: Gulli** — একটা automated script যেটা:
+
+```
+1. Google Sheet দেখে → কোন কোন software monitor করতে হবে
+2. ইন্টারনেটে গিয়ে check করে → কোনো নতুন vulnerability আছে?
+3. নতুন কিছু পেলে:
+   → Google Sheet-এ লিখে রাখে (record keeping)
+   → JIRA-তে ticket বানায় (কাউকে fix করতে হবে)
+   → Slack-এ message দেয় (team-কে জানায়)
+4. পুরনো বা already-known vulnerability → ignore করে
+```
+
+---
+
+### Gulli-র "অংশগুলো" — Python programmer-এর ভাষায়
+
+ভাবো তুমি Python-এ Gulli বানাচ্ছো:
+
+```python
+# main.py — পুরো Gulli Python-এ হলে এরকম হতো
+
+import json
+from google_sheets import read_sheet, write_to_sheet
+from rss_parser import fetch_rss
+from github_api import fetch_dependabot_alerts
+from slack_bot import send_slack_message
+from jira_api import create_jira_ticket
+
+def main():
+    # Step 1: Google Sheet থেকে feed list পড়ো
+    feeds = read_sheet("Feeds tab")
+    # feeds = [
+    #   {"name": "nginx", "url": "https://nginx.org/feed", "type": "rss"},
+    #   {"name": "my-repo", "url": "", "type": "dependabot"},
+    # ]
+
+    # Step 2: প্রতিটা feed থেকে vulnerabilities collect করো
+    all_articles = []
+    for feed in feeds:
+        if feed["type"] == "rss":
+            articles = fetch_rss(feed["url"])
+        elif feed["type"] == "dependabot":
+            articles = fetch_dependabot_alerts(feed["name"])
+        all_articles.extend(articles)
+
+    # Step 3: প্রতিটা article handle করো
+    for article in all_articles:
+        # Already known? Skip.
+        if is_in_sheet(article):
+            continue
+        
+        # Too old? Skip.
+        if article.date < six_months_ago:
+            continue
+        
+        # Pre-release (alpha/beta)? Track but don't notify.
+        if is_prerelease(article.title):
+            write_to_sheet(article)  # track করো
+            continue                  # কিন্তু notify করো না
+        
+        # New & important!
+        write_to_sheet(article)
+        create_jira_ticket(article)
+        send_slack_message(article)
+
+if __name__ == "__main__":
+    main()
+```
+
+**এটাই Gulli — Ruby-তে লেখা, কিন্তু logic exactly এটাই।**
+
+---
+
+### এখন Ruby code-এর সাথে match করো
+
+| Python concept | Ruby file | Ruby code |
+|---|---|---|
+| `main()` function | `lib/gulli.rb` | `def self.run` |
+| `read_sheet("Feeds tab")` | `lib/gulli/fetch_feeds.rb` | `FetchFeeds.call` |
+| `fetch_rss(url)` | `lib/gulli/collect_rss_articles.rb` | `CollectRSSArticles.call(feed)` |
+| `fetch_dependabot_alerts(name)` | `lib/gulli/collect_dependabot_alerts.rb` | `CollectDependabotAlerts.call(feed)` |
+| `is_in_sheet(article)` | `lib/gulli/feed_entry/base.rb` | `article.known?` |
+| `is_prerelease(title)` | `lib/gulli/feed_entry/base.rb` | `article.ignore?` |
+| `write_to_sheet(article)` | `lib/gulli/feed_entry/base.rb` | `article.remember!` |
+| `create_jira_ticket(article)` | `lib/gulli/jira_ticket_creator.rb` | `JiraTicketCreator.call(article:)` |
+| `send_slack_message(article)` | `lib/gulli/notify.rb` | `Notify.article(announcement)` |
+| Google Sheets API wrapper | `lib/gulli/spreadsheet.rb` | `Spreadsheet.get_values(range)` |
+
+---
+
+### প্রতিটা file কী — এক লাইনে
+
+| File | এটা কী | Python-এ কী হতো |
+|---|---|---|
+| `bin/gulli` | Script চালানোর file | `if __name__ == "__main__": main()` |
+| `lib/gulli.rb` | Main brain — সব coordinate করে | `main.py` |
+| `lib/gulli/spreadsheet.rb` | Google Sheet পড়া/লেখার wrapper | `google_sheets.py` |
+| `lib/gulli/fetch_feeds.rb` | Sheet থেকে "কী monitor করবো" list পড়ে | `config_reader.py` |
+| `lib/gulli/collect_rss_articles.rb` | RSS feed URL থেকে articles আনে | `rss_fetcher.py` |
+| `lib/gulli/collect_dependabot_alerts.rb` | GitHub API থেকে security alerts আনে | `github_fetcher.py` |
+| `lib/gulli/collect_google_artifact_registry_alerts.rb` | Google Docker registry check করে | `docker_checker.py` |
+| `lib/gulli/feed_entry/base.rb` | সব article-এর common logic (parent class) | `base_article.py` |
+| `lib/gulli/feed_entry/rss_article.rb` | RSS article (Base-এর child) | `rss_article.py` |
+| `lib/gulli/feed_entry/dependabot.rb` | GitHub alert (Base-এর child) | `dependabot_alert.py` |
+| `lib/gulli/feed_entry/google_artifact_registry.rb` | Docker image alert (Base-এর child) | `docker_alert.py` |
+| `lib/gulli/notify.rb` | Slack-এ message পাঠায় | `slack_notifier.py` |
+| `lib/gulli/jira_ticket_creator.rb` | JIRA ticket বানায় | `jira_creator.py` |
+| `lib/utility/assessment_due_date_generator.rb` | Due date calculate করে | `date_utils.py` |
+
+---
+
+## এখন code বুঝি — file by file, গল্পের মতো
+
+### ১. `bin/gulli` — শুরুর পয়েন্ট
+
+যখন তুমি terminal-এ `ruby bin/gulli` লেখো, Ruby এই file পড়ে:
+
+```ruby
+#!/usr/bin/env ruby
+# "আমি Ruby file" — OS কে বলছে
+
+$LOAD_PATH.unshift File.expand_path('../../lib', __FILE__)
+# Ruby কে বলছে: "lib/ folder-এ গিয়ে files খোঁজো"
+# Python-এ: sys.path.insert(0, 'lib/')
+
+require 'bundler/setup'
+# "Gemfile-এর সব library load করো"
+# Python-এ: pip install করার পর import করার মতো
+
+require 'gulli'
+# lib/gulli.rb file load করো
+
+Gulli.run
+# Gulli module-এর run method চালাও — এখান থেকেই সব শুরু
+```
+
+---
+
+### ২. `lib/gulli.rb` — মূল brain
+
+```ruby
+require 'logger'
+require 'gulli/collect_rss_articles'
+require 'gulli/collect_dependabot_alerts'
+require 'gulli/collect_google_artifact_registry_alerts'
+# দরকারি files import করো
+```
+
+```ruby
+module Gulli
+  # "Gulli" নামের বাক্স খুলছি — সব কিছু এর ভিতরে থাকবে
+```
+
+```ruby
+  FEED_ENTRY_COLLECTOR = {
+    'rss' => Gulli::CollectRSSArticles,
+    'dependabot' => Gulli::CollectDependabotAlerts,
+    'google-artifact-registry' => Gulli::CollectGoogleArtifactRegistryAlerts,
+  }.freeze
+```
+
+**এটা কী?** একটা dictionary যেটা বলে:
+- feed type "rss" হলে → `CollectRSSArticles` class ব্যবহার করো
+- feed type "dependabot" হলে → `CollectDependabotAlerts` class ব্যবহার করো
+- feed type "google-artifact-registry" হলে → `CollectGoogleArtifactRegistryAlerts` class ব্যবহার করো
+
+**কেন?** কারণ প্রতিটা type-এর data আলাদা ভাবে collect করতে হয়। RSS-এর জন্য XML parse, GitHub-র জন্য API call, Docker-এর জন্য আরেক API call।
+
+---
+
+```ruby
+  def self.run
+    clear_cache!
+    announcements.each do |announcement|
+      handle_announcement(announcement)
+    end
+  rescue StandardError => error
+    Gulli.logger.fatal error
+    Gulli::Notify.fatal "#{error.class} #{error}"
+  end
+```
+
+**বাংলায়:**
+```
+run method চালু হলো:
+  1. আগের cached data মুছে ফেলো (fresh start)
+  2. সব announcements collect করো (feeds → articles)
+  3. প্রতিটা announcement-এর জন্য handle_announcement চালাও
+  
+  যদি কোথাও error হয়:
+    → log-এ লেখো
+    → Slack-এ "Gulli crash করেছে" message পাঠাও
+```
+
+---
+
+```ruby
+  def self.feeds
+    feeds = Gulli::FetchFeeds.call
+    Gulli.logger.info "Got #{feeds.length} feeds"
+    feeds
+  end
+```
+
+**বাংলায়:**
+```
+feeds method:
+  1. Google Sheet-এর "Feeds" tab থেকে feed list পড়ো
+  2. log-এ লেখো "Got 15 feeds" (কতগুলো পেয়েছি)
+  3. feed list return করো
+```
+
+---
+
+```ruby
+  def self.announcements
+    feeds.each_with_object([]) do |feed, announcements|
+      collector = FEED_ENTRY_COLLECTOR[feed[:type]]
+      announcements.concat(collector.call(feed))
+    end
+  end
+```
+
+**বাংলায়:**
+```
+announcements method:
+  1. একটা খালি list নাও (result রাখার জন্য)
+  2. প্রতিটা feed-এর জন্য:
+     - feed-এর type দেখো (rss? dependabot? docker?)
+     - সেই type-এর collector class বের করো
+     - collector দিয়ে articles collect করো
+     - result list-এ add করো
+  3. সব articles-এর combined list return করো
+```
+
+**উদাহরণ:**
+```
+feeds = [
+  {name: "nginx", type: "rss", url: "https://..."},
+  {name: "my-repo", type: "dependabot", url: ""},
+]
+
+feed 1 → type "rss" → CollectRSSArticles.call → [article1, article2]
+feed 2 → type "dependabot" → CollectDependabotAlerts.call → [article3]
+
+result = [article1, article2, article3]
+```
+
+---
+
+```ruby
+  def self.handle_announcement(announcement)
+    if already_known_or_old?(announcement)
+      Gulli.logger.debug "Ignoring #{announcement.id} as we already know it"
+      return
+    end
+
+    if !announcement.ignore? && announcement.auto_jira_issue_create?
+      puts " [DRY RUN] Would create JIRA ticket for: #{announcement.title}"
+    end
+
+    puts " [DRY RUN] Would UPDATE Google Sheet (mark as seen): #{announcement.id}"
+    puts " [DRY RUN] Would send SLACK notification for: #{announcement.title}"
+  end
+```
+
+**বাংলায়:**
+```
+handle_announcement method — প্রতিটা article-এর জন্য:
+  
+  প্রশ্ন ১: এটা কি আগে থেকেই জানি, বা ৬ মাসের পুরনো?
+    → হ্যাঁ → ignore করো, বের হয়ে যাও
+  
+  প্রশ্ন ২: এটা কি alpha/beta/rc type না? এবং auto JIRA on আছে?
+    → হ্যাঁ → JIRA ticket বানাও
+  
+  → Google Sheet-এ লিখে রাখো (tracking)
+  → Slack-এ notify করো
+
+  (বর্তমানে DRY RUN mode — আসল কাজ করে না, শুধু print করে)
+```
+
+---
+
+### Config methods — সব ENV variable থেকে পড়ে
+
+```ruby
+  def self.config
+    @config ||= {
+      google: google_config,
+      spreadsheet: spreadsheet_config,
+      repo: repo_config,
+      slack: slack_config,
+      jira: jira_config,
+    }
+  end
+```
+
+**বাংলায়:**
+```
+config method:
+  একটা বড় dictionary বানাও সব settings নিয়ে:
+  - google settings (keyfile path)
+  - spreadsheet settings (sheet ID, ranges)
+  - repo settings (GitHub owner, token)
+  - slack settings (webhook URL, channel)
+  - jira settings (URL, username, token)
+  
+  ||= মানে: একবারই বানাও, পরে cached version ব্যবহার করো
+```
+
+```ruby
+  def self.google_config
+    { keyfile: ENV.fetch('GOOGLE_KEYFILE') }
+  end
+```
+
+**বাংলায়:** "GOOGLE_KEYFILE নামের environment variable পড়ো। না পেলে crash করো।"
+
+```ruby
+  def self.repo_config
+    {
+      owner: ENV.fetch('GITHUB_REPO_OWNER', nil),
+      token: ENV.fetch('GITHUB_REPO_ACCESS_TOKEN', nil),
+    }
+  end
+```
+
+**বাংলায়:** "GITHUB_REPO_OWNER পড়ো। না পেলে nil (None) রাখো — crash করো না।"
+
+**পার্থক্য বুঝো:**
+- `ENV.fetch('KEY')` → **না পেলে crash** (required variable)
+- `ENV.fetch('KEY', nil)` → **না পেলে nil** (optional variable)
+
+---
+
+### ৩. `lib/gulli/spreadsheet.rb` — Google Sheet-এর সাথে কথা বলে
+
+```ruby
+module Gulli
+  class Spreadsheet
+```
+
+**বাংলায়:** "Gulli বাক্সের ভিতরে Spreadsheet নামের একটা class"
+
+---
+
+#### `get_values` — Sheet থেকে data পড়ো
+
+```ruby
+    def self.get_values(range)
+      cache_key = range_cache_key(range)
+      return Gulli.cache[cache_key] if Gulli.cache[cache_key]
+```
+
+**বাংলায়:**
+```
+get_values("Feeds!A:D"):
+  1. cache key বানাও: "spreadsheet_ranges_Feeds!A:D"
+  2. cache-এ আছে? → আছে তো! আবার Google-কে call করার দরকার নেই, cache থেকে দিয়ে দাও
+```
+
+```ruby
+      values = service.get_spreadsheet_values(spreadsheet_id, range).values
+```
+
+**বাংলায়:** "Google Sheets API কে বলো: এই Sheet-এর এই range-এর data দাও।"
+
+```ruby
+      header = values.first.map(&:to_s)
+```
+
+**বাংলায়:** "প্রথম row = header (column names)। সব string-এ convert করো।"
+
+```
+Sheet data:
+Row 1: ["Name", "URL", "Type"]        ← এটা header
+Row 2: ["nginx", "https://...", "rss"] ← এটা data
+Row 3: ["redis", "https://...", "rss"] ← এটা data
+
+header = ["Name", "URL", "Type"]
+```
+
+```ruby
+      values.drop(1).map { |row| Hash[header.zip(row)] }
+```
+
+**বাংলায়:**
+```
+1. values.drop(1) → header row বাদ দাও, শুধু data rows রাখো
+2. প্রতিটা data row-কে header-এর সাথে জোড়া লাগাও:
+
+   header = ["Name", "URL", "Type"]
+   row    = ["nginx", "https://...", "rss"]
+   
+   zip করলে = [["Name","nginx"], ["URL","https://..."], ["Type","rss"]]
+   Hash বানালে = {"Name" => "nginx", "URL" => "https://...", "Type" => "rss"}
+
+3. Result = array of hashes (list of dictionaries)
+```
+
+```ruby
+      .tap do |rows|
+        Gulli.cache[cache_key] = rows
+      end
+```
+
+**বাংলায়:** "result-কে cache-এ save করো যাতে পরেরবার আবার Google-কে call না লাগে"
+
+---
+
+#### `service` — Google API client তৈরি
+
+```ruby
+    def self.service
+      Gulli.cache[:spreadsheet_service] ||= begin
+        service = Google::Apis::SheetsV4::SheetsService.new
+        service.authorization = Google::Auth::ServiceAccountCredentials.make_creds(
+          json_key_io: File.open(Gulli.config[:google][:keyfile]),
+          scope: Google::Apis::SheetsV4::AUTH_SPREADSHEETS,
+        )
+        service
+      end
+    end
+```
+
+**বাংলায়:**
+```
+service method:
+  cache-এ Google client আছে? 
+    → আছে → সেটা return করো
+    → নেই → নতুন বানাও:
+      1. Google Sheets API client তৈরি করো
+      2. keyfile.json খুলো (তোমার service account credentials)
+      3. Google-কে বলো "আমি এই account — Sheet read/write করতে চাই"
+      4. client cache-এ রাখো (পরেরবার আবার বানাতে হবে না)
+```
+
+---
+
+### ৪. `lib/gulli/fetch_feeds.rb` — Feed list পড়া
+
+```ruby
+    def feed_hash(row)
+      feed_type = row.fetch('Type', DEFAULT_FEED_TYPE) || DEFAULT_FEED_TYPE
+      {
+        name: row.fetch('Name'),
+        url: row.fetch('URL'),
+        ignore_updates: (row.fetch('Ignore Updates', false) == TRUE_VALUE),
+        type: feed_type.strip,
+        auto_jira_issue_create: (row.fetch("Don't Create Jira Issue", false) == FALSE_VALUE),
+        jira_ticket_assignee: row.fetch('story_assignee'),
+      }
+    end
+```
+
+**বাংলায়:**
+```
+Google Sheet-এর একটা row পড়ে structured data বানাও:
+
+Sheet row:
+| Name  | URL          | Type | Ignore Updates | Don't Create Jira Issue | story_assignee |
+| nginx | https://...  | rss  | FALSE          | FALSE                   | john123        |
+
+Result:
+{
+  name: "nginx",
+  url: "https://...",
+  ignore_updates: false,    ← "FALSE" == "TRUE" → false
+  type: "rss",
+  auto_jira_issue_create: true,  ← ⚠️ "FALSE" == "FALSE" → true (double negative!)
+  jira_ticket_assignee: "john123",
+}
+
+⚠️ Double negative বুঝো:
+Column name: "Don't Create Jira Issue"
+Value: "FALSE"
+মানে: "Don't Create = FALSE" = "তৈরি না করা = মিথ্যা" = "হ্যাঁ তৈরি করো"
+তাই auto_jira_issue_create = true
+```
+
+---
+
+### ৫. `lib/gulli/feed_entry/base.rb` — সব article-এর common logic
+
+এটা **parent class** — RSSArticle, Dependabot, GoogleArtifactRegistry সব এটা থেকে inherit করে।
+
+#### `known?` method — "এটা কি আগে থেকে জানি?"
+
+```ruby
+      def known?
+        Gulli::Spreadsheet.get_values(...).each_with_index do |row, index|
+          return row['id'] == id if ignore_updates
+          if row['id'] == id
+            last_updated = row['last_updated']
+            return true if last_updated == date
+            if last_updated.nil? || last_updated.empty?
+              update!((index + 2).to_s, date)
+              return true
+            end
+          end
+        end
+        false
+      end
+```
+
+**বাংলায় — গল্পের মতো:**
+```
+known? method — "আমি কি এই article আগে দেখেছি?"
+
+1. Google Sheet-এর Data tab-এর সব row পড়ো
+2. প্রতিটা row-এর জন্য:
+   
+   যদি ignore_updates on থাকে:
+     → শুধু ID match check করো
+     → ID match? → হ্যাঁ জানি (true)
+     → match না? → পরের row দেখো
+   
+   যদি ID match পাই:
+     → Sheet-এ last_updated date কী আছে?
+     → last_updated == আজকের date? → হ্যাঁ জানি, up-to-date (true)
+     → last_updated খালি? → date লিখে দাও, তারপর "জানি" বলো (true)
+     → last_updated অন্য date? → (loop চলতে থাকে — নতুন update আছে!)
+   
+3. কোনো row-তেই match পাইনি → "জানি না, এটা নতুন!" (false)
+
+index + 2 কেন?
+  Sheet-এ Row 1 = header
+  Code-এ index 0 = Sheet Row 2
+  তাই index 0 → row number 2, index 1 → row number 3, etc.
+```
+
+---
+
+#### `ignore?` method — "এটা কি alpha/beta/rc?"
+
+```ruby
+      IGNORE_REGEXP = /([.-]rc|alpha|beta|nightly|preview|snapshot|[.-]test)/i.freeze
+
+      def ignore?
+        !!(title =~ IGNORE_REGEXP)
+      end
+```
+
+**বাংলায়:**
+```
+title-এ এই word গুলোর কোনোটা আছে কিনা check করো:
+  -rc, .rc, alpha, beta, nightly, preview, snapshot, -test, .test
+
+"nginx-1.25.0-rc1" → হ্যাঁ, -rc আছে → ignore? = true (pre-release, important না)
+"nginx-1.25.0" → না, কোনোটাই নেই → ignore? = false (stable release, important!)
+
+!! মানে: 
+  regex match পেলে একটা number return হয় (match position)
+  !! দিয়ে সেটাকে true/false-এ convert করি
+  match না পেলে nil → !!nil → false
+  match পেলে 5 → !!5 → true
+```
+
+---
+
+#### `remember!` method — "Sheet-এ লিখে রাখো"
+
+```ruby
+      def remember!
+        Gulli::Spreadsheet.append(
+          Gulli.config[:spreadsheet][:ranges][:data],
+          attributes: [feed, id, identifier, url, ignore?, date, jira_ticket_link],
+        )
+      end
+```
+
+**বাংলায়:**
+```
+Data tab-এ নতুন row add করো:
+| feed   | id            | identifier  | url          | ignore | last_updated | jira_link |
+| nginx  | nginx-CVE-123 | CVE-123     | https://...  | false  | 2024-01-15   | https://jira.com/PROJ-456 |
+```
+
+---
+
+### ৬. Child Classes — Base-এর বাচ্চারা
+
+#### RSSArticle (RSS feed article):
+```ruby
+class RSSArticle < Base   # Base-এর child
+  def id
+    @entry.id              # Feedjira parser-এর দেওয়া ID
+  end
+  def title
+    @entry.title.gsub(/#{feed}/i, '').strip
+    # title থেকে feed name মুছে দাও
+    # "nginx Security Advisory" → "Security Advisory"
+  end
+  # ignore? override করে না → Base-এর regex check ব্যবহার হয়
+end
+```
+
+#### Dependabot (GitHub security alert):
+```ruby
+class Dependabot < Base
+  def id
+    "#{feed}-#{entry['number']}"   # "my-repo-42"
+  end
+  def ignore?
+    false   # Security alert কখনো ignore করো না!
+  end
+end
+```
+
+#### GoogleArtifactRegistry (Docker image alert):
+```ruby
+class GoogleArtifactRegistry < Base
+  def id
+    "#{@feed}-#{@entry['image']}"  # "my-image-sha256:abc123"
+  end
+  def ignore?
+    @ignore_updates   # Feed config-এর setting follow করো
+  end
+end
+```
+
+**বাংলায় — তিনটার পার্থক্য:**
+```
+                    RSSArticle          Dependabot           GoogleArtifactRegistry
+ID কোথা থেকে?     Feedjira parser      GitHub API           Docker digest
+ignore? কিভাবে?    title regex check    কখনো ignore না       config setting
+data কোথা থেকে?    RSS XML              GitHub JSON          Google API JSON
+```
+
+---
+
+### ৭. Notify — Slack message
+
+```ruby
+    def self.article(article)
+      unless Gulli.config[:slack][:webhook_url]
+        return   # Slack setup না থাকলে চুপচাপ skip
+      end
+      notifier.ping "নতুন vulnerability পাওয়া গেছে: #{article.title}"
+    end
+```
+
+**বাংলায়:** "Slack webhook URL setup আছে? থাকলে message পাঠাও। না থাকলে কিছু করো না।"
+
+---
+
+### ৮. JiraTicketCreator — JIRA ticket
+
+```ruby
+    def call
+      response = http_client.post(jira_url, payload.to_json)
+      if response.status == 201   # 201 = Created
+        "https://jira.com/browse/PROJ-123"  # ticket URL return
+      else
+        Gulli::Notify.fatal("JIRA fail হয়েছে!")
+        nil
+      end
+    end
+```
+
+**বাংলায়:** "JIRA API-তে POST request পাঠাও ticket বানাতে। Success? URL return করো। Fail? Slack-এ বলো।"
+
+---
+
+## Google Sheet Structure — তোমাকে কী বানাতে হবে
+
+### Tab 1: "Feeds" (Input — তুমি এখানে লেখো কী monitor করবে)
+
+| Name | URL | Type | Ignore Updates | Don't Create Jira Issue | story_assignee |
+|------|-----|------|---------------|------------------------|----------------|
+| nginx | https://nginx.org/feed.xml | rss | FALSE | FALSE | (blank) |
+| redis | https://redis.io/feed.xml | rss | FALSE | TRUE | (blank) |
+
+### Tab 2: "Data" (Output — Gulli এখানে লেখে কী পেয়েছে)
+
+| feed | id | identifier | url | ignore | last_updated | jira_ticket_link |
+|------|----|-----------|-----|--------|-------------|-----------------|
+| (Gulli fills this automatically) | | | | | | |
+
+---
+
+## Data Flow — পুরো ছবি
+
+```
+তুমি terminal-এ লেখো: ruby bin/gulli
+         │
+         ▼
+    bin/gulli চালু হয়
+    Gulli.run call হয়
+         │
+         ▼
+    ┌─ Step 1: Google Sheet-এর "Feeds" tab পড়ো
+    │   Result: [{name: "nginx", url: "...", type: "rss"}, ...]
+    │
+    ├─ Step 2: প্রতিটা feed-এর type দেখো:
+    │   type "rss" → RSS URL-এ HTTP GET → XML পার্স → articles
+    │   type "dependabot" → GitHub API call → alerts
+    │   type "google-artifact-registry" → Google API call → image info
+    │
+    ├─ Step 3: সব articles combine করো
+    │   Result: [article1, article2, article3, ...]
+    │
+    └─ Step 4: প্রতিটা article handle করো:
+        │
+        ├── Google Sheet-এ আগে থেকে আছে? → হ্যাঁ → SKIP
+        ├── ৬ মাসের পুরনো? → হ্যাঁ → SKIP
+        ├── Pre-release (alpha/beta)? → হ্যাঁ → Sheet-এ রাখো কিন্তু notify করো না
+        └── নতুন ও important → Sheet-এ রাখো + JIRA ticket + Slack notify
+```
+
+---
+
+## তোমার এখনো কোনো confusion থাকলে আমাকে বলো
+
+specifically কোনটা বুঝতে পারছো না? যেমন:
+1. কোনো specific method?
+2. কোনো Ruby syntax?
+3. Data কিভাবে flow করছে?
+4. Google Sheet-এর structure?
+5. কিভাবে locally run করবো?
+
+আমি সেটা আরো detail-এ explain করবো।
+
+
+
+
+
+4. পুরনো বা already-known vulnerability → ignore করে - how? tell explicitly in which code which line whihc file
+
+
+Data কিভাবে flow করছে?
+
+কোনো Ruby syntax? yes '?' confuses me
+
+also, can you give me a filewise code explanation in bangla in comments elaborately? along with actual code for each file? where it is also told which one is var, which one is class or method and so on etc, i will try to understand it by reading the comments
+
+
+
+
+also how does gulli distinguish that for a certain dependency it already knew that it saw it already? so that it doesnt give notifications for the same update more than once???
+
+
+
+
+
+
+
+
+
+
+============== FULL ===========
+
+# Gulli — সব Confusion দূর করা
+
+চলো একটা একটা করে তোমার সব প্রশ্নের উত্তর দিই।
+
+---
+
+## প্রশ্ন ১: "পুরনো বা already-known vulnerability ignore করে — কিভাবে?"
+
+### Already Known Check — ঠিক কোন file, কোন line?
+
+**File: `lib/gulli.rb`**, `handle_announcement` method:
+
+```ruby
+def self.handle_announcement(announcement)
+    if already_known_or_old?(announcement)    # ← এই line-এ check হয়
+      return                                   # ← known হলে এখানে বের হয়ে যায়
+    end
+    # ... বাকি code চলে শুধু যদি নতুন হয়
+end
+```
+
+**File: `lib/gulli.rb`**, `already_known_or_old?` method:
+
+```ruby
+def self.already_known_or_old?(announcement)
+    announcement.known? || announcement.published_date_before_6_months?
+    # দুইটা check:
+    # 1. known? → Sheet-এ আছে?
+    # 2. published_date_before_6_months? → ৬ মাসের পুরনো?
+    # যেকোনো একটা true হলে → ignore
+end
+```
+
+**File: `lib/gulli/feed_entry/base.rb`**, `known?` method — **এখানে আসল magic হয়:**
+
+```ruby
+def known?
+    # Step 1: Google Sheet-এর Data tab-এর সব row পড়ো
+    Gulli::Spreadsheet.get_values(Gulli.config[:spreadsheet][:ranges][:data]).
+      each_with_index do |row, index|
+      
+      # Step 2: এই row-র ID কি আমার ID-র সাথে match করে?
+      if row['id'] == id
+        # হ্যাঁ match করে! → মানে আগেও দেখেছি → return true (known!)
+        return true if last_updated == date
+      end
+    end
+    
+    # Step 3: কোনো row-তেই match পাইনি → return false (নতুন!)
+    false
+end
+```
+
+**File: `lib/gulli/feed_entry/base.rb`**, `published_date_before_6_months?`:
+
+```ruby
+def published_date_before_6_months?
+    DateTime.parse(date) < (DateTime.now - 180)
+    # article-এর date কি আজ থেকে ১৮০ দিন আগের?
+    # হ্যাঁ → true (পুরনো, ignore করো)
+    # না → false (নতুন enough)
+end
+```
+
+### পুরো Flow — ছবি দিয়ে বুঝো:
+
+```
+article আসলো (ধরো nginx-এর নতুন vulnerability)
+    │
+    ▼
+already_known_or_old?(article) call হলো
+    │
+    ├── article.known?()
+    │   │
+    │   ▼
+    │   Google Sheet-এর Data tab পড়ো:
+    │   | feed  | id              | last_updated |
+    │   | nginx | nginx-CVE-2024-001 | 2024-01-15 |
+    │   | redis | redis-CVE-2024-002 | 2024-01-10 |
+    │   
+    │   article-এর id = "nginx-CVE-2024-001"
+    │   
+    │   Row 1: row['id'] = "nginx-CVE-2024-001" == "nginx-CVE-2024-001"? ✅ MATCH!
+    │   → return true (already known!)
+    │   
+    │   (যদি match না পেতো → false, মানে নতুন)
+    │
+    ├── article.published_date_before_6_months?()
+    │   article-এর date = "2023-05-01"
+    │   আজ = "2024-01-15"
+    │   2023-05-01 < 2023-07-19 (180 দিন আগে)? → হ্যাঁ → true (পুরনো!)
+    │
+    ▼
+already_known_or_old? = true
+    │
+    ▼
+handle_announcement → return (skip! কিছু করে না)
+```
+
+---
+
+## প্রশ্ন ২: Gulli কিভাবে distinguish করে "আগে দেখেছি"?
+
+**উত্তর: প্রতিটা article-এর একটা unique ID আছে।**
+
+### ID কিভাবে বানায়?
+
+প্রতিটা article type আলাদা ভাবে ID বানায়:
+
+**RSS Article** (`feed_entry/rss_article.rb`):
+```ruby
+def id
+    @entry.id    # RSS feed-এর নিজস্ব ID (guid tag)
+end
+# Example: "https://nginx.org/advisory/2024-001"
+```
+
+**Dependabot** (`feed_entry/dependabot.rb`):
+```ruby
+def id
+    "#{feed}-#{entry['number']}"
+end
+# Example: "my-repo-42"
+# feed = "my-repo", GitHub alert number = 42
+```
+
+**Google Artifact Registry** (`feed_entry/google_artifact_registry.rb`):
+```ruby
+def id
+    "#{@feed}-#{@entry['image']}"
+end
+# Example: "my-image-sha256:deadbeef123"
+```
+
+### পুরো Process — ধাপে ধাপে:
+
+```
+দিন ১: Gulli প্রথমবার চলে
+├── nginx feed check করে
+├── পায়: CVE-2024-001 (id = "nginx-CVE-2024-001")
+├── Sheet-এ খোঁজে: "nginx-CVE-2024-001" আছে? → নেই!
+├── known? = false → নতুন!
+├── remember! চালায় → Sheet-এ লেখে:
+│   | feed  | id                   | date       |
+│   | nginx | nginx-CVE-2024-001   | 2024-01-15 |
+├── JIRA ticket বানায়
+└── Slack-এ notify করে
+
+দিন ২: Gulli আবার চলে
+├── nginx feed check করে
+├── পায়: CVE-2024-001 (same vulnerability, id = "nginx-CVE-2024-001")
+├── Sheet-এ খোঁজে: "nginx-CVE-2024-001" আছে? → আছে! ✅
+├── known? = true → পুরনো!
+├── handle_announcement → return (SKIP!)
+└── কোনো JIRA ticket বা Slack message নেই ← duplicate prevention!
+
+দিন ২ (আরেকটা): Gulli nginx-এ নতুন vulnerability পায়
+├── পায়: CVE-2024-002 (নতুন, id = "nginx-CVE-2024-002")
+├── Sheet-এ খোঁজে: "nginx-CVE-2024-002" আছে? → নেই!
+├── known? = false → নতুন!
+├── remember! → Sheet-এ add করে
+├── JIRA + Slack
+└── Sheet এখন:
+    | feed  | id                   | date       |
+    | nginx | nginx-CVE-2024-001   | 2024-01-15 |  ← পুরনো, আবার notify হবে না
+    | nginx | nginx-CVE-2024-002   | 2024-01-16 |  ← নতুন, just added
+```
+
+**সংক্ষেপে:** Google Sheet-টা হলো Gulli-র **memory**। একবার কিছু দেখলে Sheet-এ লিখে রাখে। পরেরবার চালালে Sheet check করে — আগে দেখেছি কিনা।
+
+---
+
+## প্রশ্ন ৩: `?` কী জিনিস Ruby-তে?
+
+**উত্তর:** `?` হলো শুধু **method name-এর অংশ** — কোনো special syntax না!
+
+Ruby-তে method-এর নামে `?` আর `!` ব্যবহার করা যায়। এটা শুধু **naming convention**:
+
+### `?` মানে: "এই method হ্যাঁ/না (true/false) answer দেয়"
+
+```ruby
+# Ruby:
+article.known?              # "known কি?" → true বা false
+article.ignore?             # "ignore করবো কি?" → true বা false
+article.auto_jira_issue_create?  # "auto jira create করবো কি?" → true বা false
+next_day.saturday?          # "শনিবার কি?" → true বা false
+last_updated.nil?           # "nil (None) কি?" → true বা false
+last_updated.empty?         # "খালি string কি?" → true বা false
+```
+
+**Python-এ `?` ব্যবহার করা যায় না।** Python-এ convention হলো `is_` prefix:
+
+```python
+# Python equivalent:
+article.is_known()
+article.is_ignored()
+article.is_auto_jira_issue_create()
+next_day.is_saturday()  # বা next_day.weekday() == 5
+last_updated is None
+last_updated == ""
+```
+
+### `!` মানে: "এই method কিছু change/modify করে"
+
+```ruby
+article.remember!           # Sheet-এ data WRITE করে (state change!)
+article.create_jira_ticket! # JIRA ticket CREATE করে (state change!)
+clear_cache!                # cache DELETE করে (state change!)
+article.update!(pos, data)  # Sheet UPDATE করে (state change!)
+```
+
+**Python-এ:**
+```python
+# Python-এ ! ব্যবহার করা যায় না, তাই just normal name:
+article.remember()
+article.create_jira_ticket()
+clear_cache()
+```
+
+### `?` আর `!` — সংক্ষেপে:
+
+```
+? = প্রশ্ন করে (true/false return করে, কিছু change করে না)
+! = কাজ করে (data change/modify করে)
+
+known?          → "জানো কি?" (read-only, just checking)
+remember!       → "মনে রাখো!" (data write করছে)
+nil?            → "nil কি?" (just checking)
+clear_cache!    → "cache মুছে ফেলো!" (deleting data)
+```
+
+---
+
+## প্রশ্ন ৪: Data Flow — পুরো ছবি (আরো detail)
+
+```
+তুমি লেখো: bundle exec ruby bin/gulli
+                    │
+                    ▼
+            ┌── bin/gulli ──┐
+            │ Gulli.run     │
+            └──────┬────────┘
+                   │
+                   ▼
+         ┌── Gulli.run ──────────────────────────────────────┐
+         │                                                    │
+         │  1. clear_cache! (আগের সব cached data মুছে দাও)  │
+         │                                                    │
+         │  2. Gulli.feeds (feed list আনো)                   │
+         │     │                                              │
+         │     ▼                                              │
+         │  ┌── FetchFeeds.call ───────────────────────┐     │
+         │  │                                           │     │
+         │  │  Spreadsheet.get_values("Feeds!A:D")     │     │
+         │  │     │                                     │     │
+         │  │     ▼                                     │     │
+         │  │  Google Sheets API call                   │     │
+         │  │     │                                     │     │
+         │  │     ▼                                     │     │
+         │  │  Sheet "Feeds" tab:                       │     │
+         │  │  | Name  | URL         | Type |           │     │
+         │  │  | nginx | https://... | rss  |           │     │
+         │  │  | redis | https://... | rss  |           │     │
+         │  │  | repo1 |             | dependabot |     │     │
+         │  │     │                                     │     │
+         │  │     ▼                                     │     │
+         │  │  Return: [                                │     │
+         │  │    {name:"nginx", url:"...", type:"rss"}, │     │
+         │  │    {name:"redis", url:"...", type:"rss"}, │     │
+         │  │    {name:"repo1", type:"dependabot"},     │     │
+         │  │  ]                                        │     │
+         │  └───────────────────────────────────────────┘     │
+         │                                                    │
+         │  3. Gulli.announcements (সব feed থেকে data আনো)  │
+         │     │                                              │
+         │     ▼                                              │
+         │  প্রতিটা feed-এর জন্য:                            │
+         │                                                    │
+         │  feed[0] = nginx, type = "rss"                    │
+         │  ┌── CollectRSSArticles.call ────────────┐        │
+         │  │ HTTP GET https://nginx.org/feed.xml   │        │
+         │  │ XML parse (Feedjira library)          │        │
+         │  │ Return: [RSSArticle1, RSSArticle2]    │        │
+         │  └───────────────────────────────────────┘        │
+         │                                                    │
+         │  feed[1] = redis, type = "rss"                    │
+         │  ┌── CollectRSSArticles.call ────────────┐        │
+         │  │ HTTP GET https://redis.io/feed.xml    │        │
+         │  │ Return: [RSSArticle3]                 │        │
+         │  └───────────────────────────────────────┘        │
+         │                                                    │
+         │  feed[2] = repo1, type = "dependabot"             │
+         │  ┌── CollectDependabotAlerts.call ───────┐        │
+         │  │ GitHub API GET /repos/owner/repo1/... │        │
+         │  │ Return: [DependabotAlert1]            │        │
+         │  └───────────────────────────────────────┘        │
+         │                                                    │
+         │  সব combine: [RSSArticle1, RSSArticle2,           │
+         │                RSSArticle3, DependabotAlert1]      │
+         │                                                    │
+         │  4. প্রতিটা article handle করো:                   │
+         │                                                    │
+         │  ┌── handle_announcement(RSSArticle1) ────────┐   │
+         │  │                                             │   │
+         │  │  article.known?                             │   │
+         │  │  ┌── Sheet "Data" tab check ─────────────┐ │   │
+         │  │  │ Data tab:                              │ │   │
+         │  │  │ | id                  | last_updated | │ │   │
+         │  │  │ | nginx-CVE-2024-001  | 2024-01-10   | │ │   │
+         │  │  │                                        │ │   │
+         │  │  │ article.id = "nginx-CVE-2024-001"     │ │   │
+         │  │  │ row['id'] == article.id? ✅ MATCH!     │ │   │
+         │  │  │ return true (KNOWN!)                   │ │   │
+         │  │  └────────────────────────────────────────┘ │   │
+         │  │                                             │   │
+         │  │  known? = true → SKIP! return.              │   │
+         │  └─────────────────────────────────────────────┘   │
+         │                                                    │
+         │  ┌── handle_announcement(RSSArticle2) ────────┐   │
+         │  │                                             │   │
+         │  │  article.known?                             │   │
+         │  │  ┌── Sheet "Data" tab check ─────────────┐ │   │
+         │  │  │ article.id = "nginx-CVE-2024-099"     │ │   │
+         │  │  │ Sheet-এ এই ID নেই!                     │ │   │
+         │  │  │ return false (NEW!)                    │ │   │
+         │  │  └────────────────────────────────────────┘ │   │
+         │  │                                             │   │
+         │  │  known? = false → এটা নতুন!                │   │
+         │  │                                             │   │
+         │  │  article.ignore? = false (stable release)  │   │
+         │  │  auto_jira_issue_create? = true             │   │
+         │  │  → JIRA ticket তৈরি করো ✅                  │   │
+         │  │                                             │   │
+         │  │  article.remember!                          │   │
+         │  │  → Sheet-এ নতুন row add করো ✅              │   │
+         │  │  | nginx | nginx-CVE-2024-099 | 2024-01-16 |│   │
+         │  │                                             │   │
+         │  │  Notify.article(article)                    │   │
+         │  │  → Slack-এ message পাঠাও ✅                 │   │
+         │  └─────────────────────────────────────────────┘   │
+         │                                                    │
+         └────────────────────────────────────────────────────┘
+```
+
+---
+
+## প্রশ্ন ৫: File-wise Code — Bangla Comments সহ
+
+### File 1: `bin/gulli`
+
+```ruby
+#!/usr/bin/env ruby
+# ↑ SHEBANG LINE: Operating System কে বলছে "এটা Ruby file, Ruby দিয়ে চালাও"
+
+$LOAD_PATH.unshift File.expand_path('../../lib', __FILE__)
+# ↑ $LOAD_PATH = GLOBAL VARIABLE (Ruby-র file search path list)
+# ↑ .unshift = METHOD: list-এর শুরুতে add করো
+# ↑ File.expand_path('../../lib', __FILE__) = METHOD CALL: 
+#     __FILE__ = এই file-এর path (bin/gulli)
+#     '../../lib' = ২ level উপরে গিয়ে lib/ folder
+#     Result: "/home/user/gulli/lib"
+# ↑ পুরো line-এর কাজ: "lib/ folder-এ গিয়ে require-এর file খোঁজো"
+
+require 'bundler/setup'
+# ↑ require = KEYWORD (Python-এর import)
+# ↑ 'bundler/setup' = Gemfile-এর সব library available করো
+# ↑ Python-এ: virtualenv activate করার মতো
+
+require 'gulli'
+# ↑ lib/gulli.rb file load করো
+
+Gulli.run
+# ↑ Gulli = MODULE
+# ↑ .run = MODULE METHOD call
+# ↑ পুরো application এখান থেকে শুরু
+```
+
+---
+
+### File 2: `lib/gulli.rb`
+
+```ruby
+require 'logger'
+# ↑ REQUIRE: Ruby-র built-in Logger library (console-এ log লেখার জন্য)
+
+require 'gulli/collect_rss_articles'
+# ↑ REQUIRE: lib/gulli/collect_rss_articles.rb file load করো
+
+require 'gulli/collect_dependabot_alerts'
+# ↑ REQUIRE: lib/gulli/collect_dependabot_alerts.rb file load করো
+
+require 'gulli/collect_google_artifact_registry_alerts'
+# ↑ REQUIRE: lib/gulli/collect_google_artifact_registry_alerts.rb file load করো
+
+module Gulli
+# ↑ MODULE শুরু: "Gulli" নামের একটা বাক্স/namespace তৈরি করছি
+# ↑ এর ভিতরের সব কিছু Gulli.xyz দিয়ে access হবে
+
+  FEED_ENTRY_COLLECTOR = {
+  # ↑ CONSTANT (বড় হাতের নাম = constant, পরে change করা যাবে না)
+  # ↑ TYPE: Hash (Python-এর dictionary)
+  # ↑ PURPOSE: feed type দেখে কোন collector class ব্যবহার করবো — lookup table
+
+    'rss' => Gulli::CollectRSSArticles,
+    # ↑ KEY: 'rss' (string)
+    # ↑ => : key-value separator (Python-এ : ব্যবহার হয়)
+    # ↑ VALUE: CollectRSSArticles CLASS (object না, class নিজেই)
+    # ↑ :: : namespace separator (Python-এ . ব্যবহার হয়)
+    # ↑ মানে: type "rss" হলে CollectRSSArticles class ব্যবহার করো
+
+    'dependabot' => Gulli::CollectDependabotAlerts,
+    # ↑ type "dependabot" হলে CollectDependabotAlerts class ব্যবহার করো
+
+    'google-artifact-registry' => Gulli::CollectGoogleArtifactRegistryAlerts,
+    # ↑ type "google-artifact-registry" হলে এই class ব্যবহার করো
+  }.freeze
+  # ↑ .freeze = METHOD: এই dictionary-কে immutable (unchangeable) করো
+
+
+  def self.run
+  # ↑ METHOD DEFINITION
+  # ↑ self. = MODULE METHOD (object ছাড়া call করা যায়: Gulli.run)
+  # ↑ Python-এ: @staticmethod def run():
+
+    clear_cache!
+    # ↑ METHOD CALL: Gulli.clear_cache! (নিচে defined)
+    # ↑ ! = convention: "এটা কিছু change/delete করে"
+    # ↑ কাজ: আগের cached data মুছে ফেলো, fresh start
+
+    announcements.each do |announcement|
+    # ↑ announcements = METHOD CALL: Gulli.announcements (নিচে defined)
+    #   returns: সব feed-এর সব articles-এর array
+    # ↑ .each = METHOD: array-র প্রতিটা item-এ loop চালাও
+    # ↑ do = BLOCK শুরু (Python-এর for loop body শুরু)
+    # ↑ |announcement| = BLOCK PARAMETER (Python-এর loop variable)
+    # ↑ পুরো line = Python-এর: for announcement in announcements:
+
+      handle_announcement(announcement)
+      # ↑ METHOD CALL: এই announcement handle করো (নিচে defined)
+    end
+    # ↑ BLOCK END (do-র pair)
+
+  rescue StandardError => error
+  # ↑ EXCEPTION HANDLER (Python-এর except)
+  # ↑ StandardError = Ruby-র base exception (Python-এর Exception)
+  # ↑ => error = caught exception-কে 'error' variable-এ রাখো
+  # ↑ Python-এ: except Exception as error:
+  # ↑ NOTE: rescue পুরো method body-কে try-catch করে
+
+    Gulli.logger.fatal error
+    # ↑ fatal = সবচেয়ে serious log level
+
+    Gulli::Notify.fatal "#{error.class} #{error}"
+    # ↑ Gulli::Notify = Notify CLASS (Gulli module-এর ভিতরে)
+    # ↑ .fatal = Notify-র METHOD (Slack-এ crash message পাঠায়)
+    # ↑ "#{...}" = STRING INTERPOLATION (Python-এর f"..." এর মতো)
+    # ↑ error.class = exception-এর type (যেমন RuntimeError)
+  end
+  # ↑ METHOD END
+
+
+  def self.feeds
+  # ↑ MODULE METHOD: feed list return করে
+
+    feeds = Gulli::FetchFeeds.call
+    # ↑ LOCAL VARIABLE = feeds
+    # ↑ FetchFeeds = CLASS
+    # ↑ .call = CLASS METHOD
+    # ↑ কাজ: Google Sheet থেকে feed list পড়ে
+    # ↑ returns: [{name: "nginx", url: "...", type: "rss"}, ...]
+
+    Gulli.logger.info "Got #{feeds.length} feeds"
+    # ↑ log-এ লেখো কতগুলো feed পেয়েছি
+    # ↑ feeds.length = array-র length (Python: len(feeds))
+
+    feeds
+    # ↑ IMPLICIT RETURN: Ruby-তে last line automatically return হয়
+    # ↑ Python-এ: return feeds লিখতে হতো
+  end
+
+
+  def self.announcements
+  # ↑ MODULE METHOD: সব feed থেকে সব articles collect করে return
+
+    feeds.each_with_object([]) do |feed, announcements|
+    # ↑ feeds = METHOD CALL: Gulli.feeds (উপরের method)
+    # ↑ .each_with_object([]) = METHOD:
+    #     [] = empty array (accumulator) দিয়ে শুরু
+    #     প্রতিটা iteration-এ এই array pass হয়
+    #     শেষে এই array return হয়
+    # ↑ do |feed, announcements| = BLOCK with 2 PARAMETERS
+    #     feed = current feed from feeds array
+    #     announcements = accumulator (সেই [] যেটা দিয়ে শুরু করেছি)
+    # ↑ Python-এ:
+    #     result = []
+    #     for feed in self.feeds():
+    #         ...
+    #     return result
+
+      collector = FEED_ENTRY_COLLECTOR[feed[:type]]
+      # ↑ LOCAL VARIABLE
+      # ↑ FEED_ENTRY_COLLECTOR[...] = dictionary lookup
+      # ↑ feed[:type] = feed hash থেকে :type key-র value
+      #   :type = SYMBOL (হালকা string, Python-এ "type")
+      # ↑ collector এখন একটা CLASS
+      #   যেমন: feed[:type] = "rss" → collector = CollectRSSArticles
+
+      announcements.concat(collector.call(feed))
+      # ↑ collector.call(feed) = CLASS METHOD CALL
+      #   যেমন: CollectRSSArticles.call(feed)
+      #   returns: [RSSArticle1, RSSArticle2, ...]
+      # ↑ .concat = METHOD: array-তে অন্য array-র সব items add করো
+      #   Python-এ: list.extend(other_list)
+    end
+  end
+
+
+  def self.handle_announcement(announcement)
+  # ↑ MODULE METHOD
+  # ↑ PARAMETER: announcement = একটা feed entry object
+  #   (RSSArticle, Dependabot, বা GoogleArtifactRegistry)
+
+    if already_known_or_old?(announcement)
+    # ↑ METHOD CALL: নিচে defined
+    # ↑ ? = convention: boolean return করে
+
+      Gulli.logger.debug "Ignoring #{announcement.id} as we already know it"
+      # ↑ announcement.id = INSTANCE METHOD call
+      #   প্রতিটা article type আলাদা ভাবে id বানায়
+
+      return
+      # ↑ EARLY RETURN: method থেকে বের হয়ে যাও
+      # ↑ বাকি code execute হবে না
+    end
+
+    if !announcement.ignore? && announcement.auto_jira_issue_create?
+    # ↑ ! = NOT operator
+    # ↑ announcement.ignore? = "ignore করবো কি?" (true/false)
+    #   !ignore? = "ignore করবো না" = "important!"
+    # ↑ && = AND operator (Python-এ and)
+    # ↑ auto_jira_issue_create? = "auto JIRA ticket চালু আছে কি?"
+    # ↑ পুরো condition: "important AND jira enabled"
+
+      # announcement.create_jira_ticket!(article: announcement) ###########
+      # ↑ COMMENTED OUT (# দিয়ে) — DRY RUN mode-এ আসল JIRA call হয় না
+
+      puts " [DRY RUN] Would create JIRA ticket for: #{announcement.title}"
+      # ↑ puts = BUILT-IN: print to console (Python-এর print())
+    end
+
+    Gulli.logger.debug "#{announcement.id} is unknown, remembering it"
+
+    # announcement.remember! unless announcement.published_date_before_6_months? ######
+    # ↑ COMMENTED OUT — DRY RUN mode
+    # ↑ unless = "if not" → "৬ মাসের পুরনো না হলে Sheet-এ save করো"
+    # ↑ remember! = Sheet-এ নতুন row append
+
+    puts " [DRY RUN] Would UPDATE Google Sheet (mark as seen): #{announcement.id}"
+
+    # Gulli::Notify.article(announcement) unless announcement.ignore? #######
+    # ↑ COMMENTED OUT — DRY RUN mode
+    # ↑ "ignore করার মতো না হলে Slack-এ notify করো"
+
+    puts " [DRY RUN] Would send SLACK notification for: #{announcement.title}"
+  end
+
+
+  def self.already_known_or_old?(announcement)
+  # ↑ MODULE METHOD
+  # ↑ ? = boolean return
+  # ↑ PURPOSE: "এটা কি আগে থেকে জানি বা পুরনো?"
+
+    announcement.known? || announcement.published_date_before_6_months?
+    # ↑ || = OR operator (Python-এ or)
+    # ↑ known? = "Sheet-এ আছে?" (true/false)
+    # ↑ published_date_before_6_months? = "৬ মাসের পুরনো?" (true/false)
+    # ↑ যেকোনো একটা true → পুরো expression true
+    # ↑ SHORT-CIRCUIT: known? true হলে দ্বিতীয়টা check-ই হবে না
+    # ↑ IMPLICIT RETURN: এই expression-এর result return হবে
+  end
+
+
+  def self.config
+  # ↑ MODULE METHOD
+  # ↑ PURPOSE: সব configuration একটা dictionary-তে
+
+    @config ||= {
+    # ↑ @config = INSTANCE VARIABLE (module level-এ)
+    # ↑ ||= = MEMOIZATION OPERATOR
+    #   মানে: @config nil হলে → right side calculate করে set করো
+    #          @config already আছে? → কিছু করো না, পুরনোটাই দাও
+    # ↑ Python-এ:
+    #   if self._config is None:
+    #       self._config = {...}
+    #   return self._config
+
+      google: google_config,
+      # ↑ google: = SYMBOL KEY (:google)
+      # ↑ google_config = METHOD CALL: Gulli.google_config (নিচে defined)
+
+      spreadsheet: spreadsheet_config,
+      repo: repo_config,
+      slack: slack_config,
+      jira: jira_config,
+    }
+  end
+
+
+  def self.google_config
+  # ↑ MODULE METHOD: Google-র settings return
+
+    {
+      keyfile: ENV.fetch('GOOGLE_KEYFILE'),
+      # ↑ keyfile: = SYMBOL KEY
+      # ↑ ENV = GLOBAL CONSTANT: environment variables-এর dictionary
+      # ↑ .fetch('GOOGLE_KEYFILE') = METHOD: value পড়ো
+      #   না পেলে ERROR RAISE করো (program crash)
+      # ↑ Python-এ: os.environ['GOOGLE_KEYFILE']
+    }
+  end
+
+
+  def self.spreadsheet_config
+    {
+      id: ENV.fetch('SPREADSHEET_ID'),
+      # ↑ Google Sheet-এর ID (URL-এ থাকে)
+
+      ranges: {
+      # ↑ NESTED HASH: ranges key-র value আরেকটা dictionary
+
+        feeds: ENV.fetch('SPREADSHEET_RANGES_FEEDS'),
+        # ↑ যেমন: "Feeds!A:D" — Feeds tab-এর A থেকে D column
+
+        data: ENV.fetch('SPREADSHEET_RANGES_DATA'),
+        # ↑ যেমন: "Data!A:G" — Data tab-এর A থেকে G column
+
+        update_sheet: ENV.fetch('SPREADSHEET_UPDATE_SHEET'),
+        # ↑ যেমন: "Data!" — update-এর জন্য sheet prefix
+
+        update_column: ENV.fetch('SPREADSHEET_UPDATE_COLUMN'),
+        # ↑ যেমন: "F" — last_updated column
+      },
+    }
+  end
+
+
+  def self.repo_config
+    {
+      owner: ENV.fetch('GITHUB_REPO_OWNER', nil),
+      # ↑ ENV.fetch('KEY', nil) = না পেলে nil (crash করে না)
+      # ↑ Python-এ: os.environ.get('KEY', None)
+
+      token: ENV.fetch('GITHUB_REPO_ACCESS_TOKEN', nil),
+    }
+  end
+
+
+  def self.slack_config
+    {
+      webhook_url: ENV.fetch('SLACK_WEBHOOK_URL', nil),
+      channel: ENV.fetch('SLACK_CHANNEL', nil),
+      username: ENV.fetch('SLACK_USERNAME', nil),
+      icon: ENV.fetch('SLACK_ICON', nil),
+    }
+  end
+
+
+  def self.jira_config
+    {
+      base_url: ENV.fetch('JIRA_BASE_URL', nil),
+      username: ENV.fetch('JIRA_USERNAME', nil),
+      api_token: ENV.fetch('JIRA_API_TOKEN', nil),
+      project_key: ENV.fetch('JIRA_PROJECT_KEY', nil),
+      issue_type: ENV.fetch('JIRA_ISSUE_TYPE', nil),
+      project_name: ENV.fetch('JIRA_PROJECT_NAME', nil),
+    }
+  end
+
+
+  def self.logger
+  # ↑ MODULE METHOD: Logger object return
+
+    @logger = Logger.new($stdout)
+    # ↑ @logger = INSTANCE VARIABLE
+    # ↑ Logger.new() = CONSTRUCTOR: নতুন Logger object তৈরি
+    # ↑ $stdout = GLOBAL VARIABLE: standard output (terminal/console)
+  end
+
+
+  def self.cache
+  # ↑ MODULE METHOD: cache dictionary return
+
+    @cache ||= {}
+    # ↑ ||= = MEMOIZATION: প্রথমবার empty hash, পরেরবার same hash
+  end
+
+  def self.clear_cache!
+  # ↑ MODULE METHOD
+  # ↑ ! = state change করে (cache মুছে ফেলে)
+
+    @cache = {}
+    # ↑ = (||= না!) → force new empty hash (reset)
+  end
+end
+# ↑ MODULE END
+
+
+require 'gulli/fetch_feeds'
+require 'gulli/notify'
+# ↑ FILE শেষে REQUIRE — কেন?
+# ↑ fetch_feeds আর notify নিজেরা Gulli.config ব্যবহার করে
+# ↑ তাই Gulli module আগে define হতে হবে, তারপর এগুলো load
+# ↑ এটাকে "circular dependency avoid" বলে
+```
+
+---
+
+### File 3: `lib/gulli/spreadsheet.rb`
+
+```ruby
+require 'google/apis/sheets_v4'
+# ↑ REQUIRE: Google Sheets API v4 library
+
+require 'googleauth'
+# ↑ REQUIRE: Google authentication library
+
+module Gulli
+  class Spreadsheet
+  # ↑ CLASS DEFINITION: Gulli module-এর ভিতরে Spreadsheet class
+  # ↑ Full name: Gulli::Spreadsheet
+  # ↑ PURPOSE: Google Sheet পড়া, update করা, নতুন row add করা
+
+
+    def self.get_values(range)
+    # ↑ CLASS METHOD
+    # ↑ PARAMETER: range = string, যেমন "Feeds!A:D" বা "Data!A:G"
+    # ↑ RETURNS: array of hashes (প্রতিটা hash = একটা row)
+    # ↑ PURPOSE: Google Sheet থেকে data পড়ো
+
+      cache_key = range_cache_key(range)
+      # ↑ LOCAL VARIABLE
+      # ↑ range_cache_key() = HELPER METHOD (নিচে defined)
+      # ↑ returns: "spreadsheet_ranges_Feeds!A:D" (cache-র key)
+
+      return Gulli.cache[cache_key] if Gulli.cache[cache_key]
+      # ↑ CONDITIONAL RETURN
+      # ↑ Gulli.cache = module-র cache dictionary
+      # ↑ Gulli.cache[cache_key] = cache-এ এই range-এর data আছে?
+      # ↑ if ... = TRAILING IF (condition পরে লেখা)
+      # ↑ আছে? → সরাসরি cache থেকে return (Google API call লাগবে না!)
+
+      values = service.get_spreadsheet_values(spreadsheet_id, range).values
+      # ↑ LOCAL VARIABLE
+      # ↑ service = CLASS METHOD (নিচে defined) — Google API client
+      # ↑ .get_spreadsheet_values() = Google API METHOD
+      # ↑ spreadsheet_id = CLASS METHOD — sheet-এর ID
+      # ↑ range = parameter, যেমন "Feeds!A:D"
+      # ↑ .values = API response থেকে data array
+      # ↑ returns: 2D array, যেমন:
+      #   [["Name","URL","Type"], ["nginx","https://...","rss"]]
+
+      header = values.first.map(&:to_s)
+      # ↑ values.first = FIRST element (প্রথম row = header)
+      # ↑ .map(&:to_s) = প্রতিটা element-কে string-এ convert
+      #   &:to_s = shorthand for { |x| x.to_s }
+      # ↑ result: ["Name", "URL", "Type"]
+
+      values.drop(1).map { |row| Hash[header.zip(row)] }.tap do |rows|
+      # ↑ values.drop(1) = header row বাদ (Python: values[1:])
+      #
+      # ↑ .map { |row| ... } = প্রতিটা row transform করো
+      #   |row| = BLOCK PARAMETER (current row)
+      #
+      # ↑ header.zip(row) = দুই array-কে pair করো
+      #   ["Name","URL"].zip(["nginx","https://..."])
+      #   = [["Name","nginx"], ["URL","https://..."]]
+      #
+      # ↑ Hash[...] = pairs → dictionary
+      #   = {"Name"=>"nginx", "URL"=>"https://..."}
+      #
+      # ↑ .tap do |rows| = result change না করে side-effect করো
+      #   |rows| = সব row-র array
+
+        Gulli.logger.debug "Caching for range #{range}"
+        Gulli.cache[cache_key] = rows
+        # ↑ CACHE STORE: পরের call-এ API call না লাগে
+      end
+      # ↑ .tap শেষ — rows array return হয়
+    end
+
+
+    def self.update(range, attributes:)
+    # ↑ CLASS METHOD
+    # ↑ range = cell range, যেমন "Data!F5:F5"
+    # ↑ attributes: = KEYWORD ARGUMENT (: suffix = keyword, নাম দিয়ে call করতে হবে)
+    # ↑ PURPOSE: Sheet-এর specific cell update করো
+
+      value_range = Google::Apis::SheetsV4::ValueRange.new(values: [attributes])
+      # ↑ LOCAL VARIABLE
+      # ↑ ValueRange = Google API CLASS
+      # ↑ .new() = CONSTRUCTOR (object তৈরি)
+      # ↑ values: [attributes] = data to write
+
+      service.update_spreadsheet_value(
+      # ↑ Google API call: cell update
+        spreadsheet_id,
+        # ↑ কোন sheet
+        range,
+        # ↑ কোন cell
+        value_range,
+        # ↑ কী data লিখবে
+        value_input_option: :raw,
+        # ↑ :raw = SYMBOL: data as-is রাখো, auto-format করো না
+      ).tap do
+      # ↑ .tap = update-এর পরে side-effect
+
+        Gulli.logger.debug "Reset cache for range #{range}"
+        Gulli.cache.delete range_cache_key(range)
+        # ↑ .delete = Hash METHOD: key remove করো
+        # ↑ data change হয়েছে, তাই পুরনো cache আর valid না → delete
+      end
+    end
+
+
+    def self.append(range, attributes:)
+    # ↑ CLASS METHOD
+    # ↑ PURPOSE: Sheet-এ নতুন row add করো (শেষে)
+    # ↑ update-এর মতোই, কিন্তু append (overwrite না, add)
+
+      value_range = Google::Apis::SheetsV4::ValueRange.new(values: [attributes])
+      service.append_spreadsheet_value(
+      # ↑ append_spreadsheet_value = Google API METHOD (update না, append!)
+        spreadsheet_id,
+        range,
+        value_range,
+        value_input_option: :raw,
+      ).tap do
+        Gulli.logger.debug "Reset cache for range #{range}"
+        Gulli.cache.delete range_cache_key(range)
+      end
+    end
+
+
+    def self.service
+    # ↑ CLASS METHOD
+    # ↑ RETURNS: Google Sheets API client (memoized — একবারই তৈরি হয়)
+
+      Gulli.cache[:spreadsheet_service] ||= begin
+      # ↑ Gulli.cache[:spreadsheet_service] = cache-এ client আছে?
+      # ↑ ||= = MEMOIZATION: nil হলে create, otherwise reuse
+      # ↑ begin...end = MULTI-LINE BLOCK: multiple lines-এর result
+
+                                              service = Google::Apis::SheetsV4::SheetsService.new
+                                              # ↑ LOCAL VARIABLE
+                                              # ↑ SheetsService = CLASS
+                                              # ↑ .new = CONSTRUCTOR
+
+                                              service.client_options.application_name = 'Auto GUL'
+                                              # ↑ PROPERTY SET: app-এর নাম (Google-কে বলে কে call করছে)
+
+                                              Gulli.logger.debug 'Authorizing with Google'
+
+                                              service.authorization = Google::Auth::ServiceAccountCredentials.make_creds(
+                                              # ↑ PROPERTY SET: authorization credentials
+                                              # ↑ .make_creds = CLASS METHOD: credentials তৈরি
+
+                                                json_key_io: File.open(Gulli.config[:google][:keyfile]),
+                                                # ↑ KEYWORD ARG
+                                                # ↑ File.open() = file open (Python: open())
+                                                # ↑ Gulli.config[:google][:keyfile] = keyfile.json path
+                                                # ↑ এটা তোমার service account credentials file!
+
+                                                scope: Google::Apis::SheetsV4::AUTH_SPREADSHEETS,
+                                                # ↑ KEYWORD ARG
+                                                # ↑ AUTH_SPREADSHEETS = CONSTANT
+                                                # ↑ = "https://www.googleapis.com/auth/spreadsheets"
+                                                # ↑ মানে: "Sheet read+write permission চাই"
+                                              )
+
+                                              service
+                                              # ↑ IMPLICIT RETURN: এই service object cache-এ store হবে
+                                            end
+    end
+
+
+    def self.spreadsheet_id
+    # ↑ CLASS METHOD (helper)
+      Gulli.config[:spreadsheet][:id]
+      # ↑ NESTED HASH ACCESS: config → spreadsheet → id
+      # ↑ Python-এ: Gulli.config['spreadsheet']['id']
+    end
+
+    def self.range_cache_key(range)
+    # ↑ CLASS METHOD (helper)
+    # ↑ PURPOSE: cache-র জন্য unique key বানাও
+      "spreadsheet_ranges_#{range}"
+      # ↑ STRING INTERPOLATION
+      # ↑ যেমন: "spreadsheet_ranges_Feeds!A:D"
+    end
+  end
+end
+```
+
+---
+
+### File 4: `lib/gulli/fetch_feeds.rb`
+
+```ruby
+require 'google/apis/sheets_v4'
+require 'googleauth'
+require 'gulli/spreadsheet'
+
+module Gulli
+  class FetchFeeds
+  # ↑ CLASS: Gulli::FetchFeeds
+  # ↑ PURPOSE: Google Sheet থেকে feed list পড়ে structured hash array return
+
+    TRUE_VALUE = 'TRUE'.freeze
+    # ↑ CONSTANT: Google Sheet-এ TRUE text হিসেবে থাকে
+    # ↑ .freeze = immutable করো
+
+    FALSE_VALUE = 'FALSE'.freeze
+    # ↑ CONSTANT: Google Sheet-এ FALSE text হিসেবে থাকে
+
+    DEFAULT_FEED_TYPE = 'rss'.freeze
+    # ↑ CONSTANT: Type column খালি হলে default "rss" ধরো
+
+
+    def self.call
+    # ↑ CLASS METHOD: বাইরে থেকে FetchFeeds.call দিয়ে call হয়
+      new.call
+      # ↑ new = CONSTRUCTOR: FetchFeeds-এর instance তৈরি
+      # ↑ .call = INSTANCE METHOD (নিচে defined)
+      # ↑ Pattern: class method → instance বানাও → instance method call করো
+    end
+
+
+    def call
+    # ↑ INSTANCE METHOD (self. নেই তাই instance method)
+    # ↑ RETURNS: array of feed config hashes
+
+      Gulli.logger.debug 'Fetching feed list'
+
+      values = Gulli::Spreadsheet.get_values(Gulli.config[:spreadsheet][:ranges][:feeds])
+      # ↑ LOCAL VARIABLE
+      # ↑ Sheet-এর Feeds tab পড়ো
+      # ↑ returns: [{"Name"=>"nginx", "URL"=>"https://...", "Type"=>"rss"}, ...]
+
+      values.map do |row|
+      # ↑ .map = প্রতিটা element transform করো
+      # ↑ do |row| = BLOCK: row = current row hash
+
+        feed_hash(row)
+        # ↑ INSTANCE METHOD CALL (নিচে defined)
+        # ↑ row → structured hash-এ convert
+      end
+      # ↑ .map-এর result (array of hashes) IMPLICIT RETURN হয়
+    end
+
+
+    def feed_hash(row)
+    # ↑ INSTANCE METHOD
+    # ↑ PARAMETER: row = Hash (Sheet-এর একটা row)
+    # ↑ RETURNS: structured feed config hash
+
+      feed_type = row.fetch('Type', DEFAULT_FEED_TYPE) || DEFAULT_FEED_TYPE
+      # ↑ LOCAL VARIABLE
+      # ↑ row.fetch('Type', DEFAULT_FEED_TYPE) = Hash METHOD:
+      #     'Type' key খোঁজো
+      #     না পেলে DEFAULT_FEED_TYPE ('rss') return করো
+      # ↑ || DEFAULT_FEED_TYPE = OR:
+      #     fetch-এর result nil হলেও 'rss' ব্যবহার করো
+      # ↑ দুই স্তরের fallback: key নেই → default, key আছে কিন্তু nil → default
+
+      {
+        name: row.fetch('Name'),
+        # ↑ name: = SYMBOL KEY (:name)
+        # ↑ row.fetch('Name') = 'Name' column-এর value
+        #   না পেলে ERROR (required field)
+
+        url: row.fetch('URL'),
+        # ↑ feed-এর URL
+
+        ignore_updates: (row.fetch('Ignore Updates', false) == TRUE_VALUE),
+        # ↑ BOOLEAN EXPRESSION
+        # ↑ row.fetch('Ignore Updates', false) = column value, default false
+        # ↑ == TRUE_VALUE = "TRUE" string-এর সাথে compare?
+        # ↑ "TRUE" == "TRUE" → true
+        # ↑ "FALSE" == "TRUE" → false
+        # ↑ false == "TRUE" → false
+
+        type: feed_type.strip,
+        # ↑ .strip = whitespace remove (Python-এও .strip())
+
+        auto_jira_issue_create: (row.fetch("Don't Create Jira Issue", false) == FALSE_VALUE),
+        # ↑ ⚠️ DOUBLE NEGATIVE LOGIC!
+        # ↑ Column name: "Don't Create Jira Issue"
+        # ↑ Column value: "FALSE"
+        # ↑ "FALSE" == "FALSE" → true
+        # ↑ মানে: "Don't Create = FALSE" = "না বানানো = মিথ্যা" = "হ্যাঁ বানাও!"
+        # ↑ তাই auto_jira_issue_create: true
+
+        jira_ticket_assignee: row.fetch('story_assignee'),
+        # ↑ JIRA ticket কাকে assign হবে
+      }
+    end
+  end
+end
+```
+
+---
+
+### File 5: `lib/gulli/feed_entry/base.rb`
+
+```ruby
+require 'gulli/jira_ticket_creator'
+require 'gulli/spreadsheet'
+require 'date'
+# ↑ date = Ruby stdlib, DateTime class ব্যবহারের জন্য
+
+module Gulli
+  module FeedEntry
+  # ↑ NESTED MODULE: Gulli::FeedEntry
+  # ↑ feed entry classes-এর namespace (বাক্সের ভিতর বাক্স)
+
+    class Base
+    # ↑ CLASS: Gulli::FeedEntry::Base
+    # ↑ PURPOSE: সব feed entry type-এর PARENT class
+    # ↑ RSSArticle, Dependabot, GoogleArtifactRegistry — সব এটা থেকে inherit করে
+    # ↑ Python-এ: class Base: (abstract base class এর মতো)
+
+
+      IGNORE_REGEXP = /([.-]rc|alpha|beta|nightly|preview|snapshot|[.-]test)/i.freeze
+      # ↑ CONSTANT: Regular Expression (regex)
+      # ↑ / ... / = REGEX LITERAL (Python-এ: re.compile(r'...'))
+      # ↑ ( ) = capture group
+      # ↑ | = OR
+      # ↑ [.-] = character class: . অথবা -
+      # ↑ /i = FLAG: case insensitive (বড়/ছোট হাতের পার্থক্য নেই)
+      # ↑ .freeze = immutable
+      # ↑ MATCHES: "-rc1", ".rc2", "alpha", "beta3", "nightly", "preview", "snapshot", "-test"
+      # ↑ PURPOSE: pre-release version ধরতে (stable release না, তাই কম important)
+
+
+      attr_reader :entry, :ignore_updates, :feed, :auto_jira_issue_create,
+                  :jira_ticket_link, :jira_ticket_assignee
+      # ↑ ATTR_READER = AUTO-GENERATED GETTER METHODS
+      # ↑ প্রতিটা :name-এর জন্য automatically একটা method তৈরি হয়:
+      #     def entry; @entry; end       ← @entry পড়ার method
+      #     def feed; @feed; end         ← @feed পড়ার method
+      #     ... etc.
+      # ↑ Python-এ: self.entry, self.feed etc. automatically accessible
+      #   কিন্তু Ruby-তে @entry private — attr_reader ছাড়া বাইরে থেকে পড়া যায় না
+
+
+      def initialize(feed:, entry:, ignore_updates:, auto_jira_issue_create:, jira_ticket_assignee:)
+      # ↑ CONSTRUCTOR (Python-এর __init__)
+      # ↑ সব KEYWORD ARGUMENTS (: suffix)
+      # ↑ call করার সময়: Base.new(feed: "nginx", entry: data, ...)
+
+        @feed = feed
+        # ↑ @feed = INSTANCE VARIABLE (Python-এর self.feed)
+        # ↑ feed = parameter value
+        # ↑ মানে: এই object-এর নিজস্ব feed variable-এ parameter-এর value রাখো
+
+        @entry = entry
+        # ↑ raw data store
+        # ↑ RSS-এর জন্য: Feedjira parsed entry object
+        # ↑ Dependabot-এর জন্য: GitHub API response hash
+        # ↑ GAR-এর জন্য: collector-এ বানানো hash
+
+        @ignore_updates = ignore_updates
+        @auto_jira_issue_create = auto_jira_issue_create
+
+        @jira_ticket_link = nil
+        # ↑ শুরুতে nil (None) — JIRA ticket তৈরি হলে পরে set হবে
+
+        @jira_ticket_assignee = jira_ticket_assignee
+      end
+
+
+      def known?
+      # ↑ INSTANCE METHOD
+      # ↑ ? = convention: true/false return করে
+      # ↑ PURPOSE: "এই article কি আগে থেকেই Google Sheet-এ tracked?"
+      # ↑ RETURNS: true (আগে দেখেছি) বা false (নতুন!)
+
+        Gulli::Spreadsheet.get_values(Gulli.config[:spreadsheet][:ranges][:data]).
+        # ↑ Google Sheet-এর Data tab পড়ো
+        # ↑ returns: [{"id"=>"nginx-CVE-001", "last_updated"=>"2024-01-10"}, ...]
+        # ↑ . (line শেষে dot) = method chain পরের line-এ continue
+
+          each_with_index do |row, index|
+          # ↑ .each_with_index = loop with index
+          # ↑ |row, index| = 2 BLOCK PARAMETERS
+          #     row = current row hash ({"id"=>"...", "last_updated"=>"..."})
+          #     index = 0-based position (0, 1, 2, ...)
+          # ↑ Python-এ: for index, row in enumerate(rows):
+
+          return row['id'] == id if ignore_updates
+          # ↑ CONDITIONAL RETURN with TRAILING IF
+          # ↑ ignore_updates = attr_reader (getter) → @ignore_updates value
+          # ↑ যদি ignore_updates true:
+          #     row['id'] == id → ID match? true : false return করো
+          #     date check করো না
+          # ↑ id = INSTANCE METHOD (child class-এ defined)
+          #     RSSArticle-এ: @entry.id
+          #     Dependabot-এ: "#{feed}-#{entry['number']}"
+
+          if row['id'] == id
+          # ↑ ID match পেয়েছি! (এই article আগেও দেখেছিলাম)
+
+            last_updated = row['last_updated']
+            # ↑ LOCAL VARIABLE: Sheet-এ stored last_updated value
+
+            return true if last_updated == date
+            # ↑ last_updated date আর current date same? → definitely known
+            # ↑ date = INSTANCE METHOD (child class-এ defined)
+
+            if last_updated.nil? || last_updated.empty?
+            # ↑ .nil? = METHOD: nil (None) কি? → true/false
+            # ↑ .empty? = METHOD: খালি string ("") কি? → true/false
+            # ↑ || = OR
+            # ↑ মানে: last_updated column খালি?
+
+              update!((index + 2).to_s, date)
+              # ↑ update! = INSTANCE METHOD (নিচে defined)
+              # ↑ ! = state change (Sheet-এ write করে)
+              # ↑ (index + 2) = Sheet-এর row number
+              #     index 0 = Sheet row 2 (row 1 = header)
+              #     তাই: index + 2
+              # ↑ .to_s = integer to string convert
+              # ↑ date = current date লিখে দাও empty cell-এ
+
+              return true
+              # ↑ updated → treat as known (আবার notify করো না)
+            end
+          end
+        end
+
+        false
+        # ↑ IMPLICIT RETURN: loop-এ কোনো match পাইনি
+        # ↑ মানে: এটা সম্পূর্ণ নতুন article!
+      end
+
+
+      def published_date_before_6_months?
+      # ↑ INSTANCE METHOD
+      # ↑ ? = boolean
+      # ↑ PURPOSE: article কি ৬ মাসের (১৮০ দিন) পুরনো?
+
+        DateTime.parse(date) < (DateTime.now - 180)
+        # ↑ DateTime.parse(date) = string → DateTime object
+        #     date = "2024-01-15" → DateTime object
+        # ↑ DateTime.now = এই মুহূর্তের date-time
+        # ↑ - 180 = ১৮০ দিন আগের date
+        # ↑ < = comparison: article-এর date কি ১৮০ দিনের আগের?
+        # ↑ true = হ্যাঁ পুরনো, false = না নতুন
+      end
+
+
+      def update!(position, data)
+      # ↑ INSTANCE METHOD
+      # ↑ ! = state change (Sheet update)
+      # ↑ PARAMETERS:
+      #     position = row number string ("5")
+      #     data = যা লিখবে (date string)
+
+        sheet_config = Gulli.config[:spreadsheet][:ranges]
+        # ↑ LOCAL VARIABLE: config-এর shortcut
+
+        update_position = format(
+        # ↑ format = KERNEL METHOD: string format (Python-এর str.format())
+
+          '%s%s%s:%s%s',
+          # ↑ %s = string placeholder
+
+          sheet_config[:update_sheet],  # "Data!"
+          sheet_config[:update_column], # "F"
+          position,                     # "5"
+          sheet_config[:update_column], # "F"
+          position,                     # "5"
+        )
+        # ↑ Result: "Data!F5:F5" = single cell range
+        # ↑ মানে: Data sheet-এর F column-এর 5 নম্বর row
+
+        Gulli::Spreadsheet.update(update_position, attributes: [data])
+        # ↑ সেই cell-এ data write করো
+      end
+
+
+      def remember!
+      # ↑ INSTANCE METHOD
+      # ↑ ! = state change (Sheet-এ নতুন row add করে)
+      # ↑ PURPOSE: "এই article দেখেছি — Sheet-এ লিখে রাখো"
+
+        Gulli::Spreadsheet.append(
+          Gulli.config[:spreadsheet][:ranges][:data],
+          # ↑ range: "Data!A:G" — Data tab
+
+          attributes: [feed, id, identifier, url, ignore?, date, jira_ticket_link],
+          # ↑ KEYWORD ARG: array of values (একটা row-র columns)
+          # ↑ feed = feed name ("nginx")
+          # ↑ id = unique ID ("nginx-CVE-2024-001")
+          # ↑ identifier = CVE ID বা title
+          # ↑ url = article URL
+          # ↑ ignore? = METHOD CALL → true/false
+          # ↑ date = publish date
+          # ↑ jira_ticket_link = JIRA URL বা nil
+          #
+          # ↑ Sheet-এ যা লেখা হবে:
+          # | nginx | nginx-CVE-2024-001 | CVE-2024-001 | https://... | false | 2024-01-15 | https://jira.com/PROJ-123 |
+        )
+      end
+
+
+      def create_jira_ticket!(article:)
+      # ↑ INSTANCE METHOD
+      # ↑ ! = state change (@jira_ticket_link set হয়)
+      # ↑ KEYWORD ARG: article = announcement object itself
+
+        @jira_ticket_link = Gulli::JiraTicketCreator.call(article: article)
+        # ↑ @jira_ticket_link = INSTANCE VARIABLE-এ save
+        # ↑ JiraTicketCreator.call = JIRA ticket create করে
+        # ↑ returns: "https://jira.com/browse/PROJ-123" বা nil (fail হলে)
+        # ↑ remember!-এ এই link Sheet-এ save হবে
+      end
+
+
+      def ignore?
+      # ↑ INSTANCE METHOD
+      # ↑ ? = boolean return
+      # ↑ PURPOSE: title-এ pre-release marker আছে কি?
+
+        !!(title =~ IGNORE_REGEXP)
+        # ↑ title = INSTANCE METHOD (child class defines)
+        # ↑ =~ = REGEX MATCH OPERATOR
+        #     match পেলে: position number return (যেমন 5)
+        #     match না পেলে: nil return
+        # ↑ !! = DOUBLE NEGATION — force boolean:
+        #     !!nil → !true → false
+        #     !!5 → !false → true
+        # ↑ Python equivalent:
+        #     return bool(re.search(IGNORE_REGEXP, self.title()))
+        #
+        # ↑ Example:
+        #     title = "nginx-1.25.0-rc1" → rc match → true (ignore!)
+        #     title = "nginx-1.25.0" → no match → false (don't ignore!)
+      end
+
+
+      def auto_jira_issue_create?
+      # ↑ INSTANCE METHOD
+      # ↑ ? = boolean
+
+        !!auto_jira_issue_create
+        # ↑ auto_jira_issue_create = ATTR_READER → @auto_jira_issue_create
+        # ↑ !! = force boolean (nil → false, any truthy value → true)
+      end
+    end
+  end
+end
+```
+
+---
+
+### File 6: `lib/gulli/feed_entry/rss_article.rb`
+
+```ruby
+require 'gulli/feed_entry/base'
+
+module Gulli
+  module FeedEntry
+    class RSSArticle < Base
+    # ↑ CLASS with INHERITANCE
+    # ↑ < Base = Base class থেকে inherit করছে (Base-এর child)
+    # ↑ Python-এ: class RSSArticle(Base):
+    # ↑ Base-এর সব method (known?, remember!, ignore?, etc.) পেয়ে যায়
+    # ↑ নিচে শুধু RSS-specific methods define করছে
+
+
+      def id
+      # ↑ INSTANCE METHOD (Base-এ abstract-like — child-এ implement)
+        @entry.id
+        # ↑ @entry = Feedjira parsed entry object
+        # ↑ .id = Feedjira-র method — RSS <guid> বা Atom <id>
+        # ↑ Example: "https://nginx.org/advisory/2024-001"
+      end
+
+      def url
+        @entry.url
+        # ↑ article-এর URL/link
+      end
+
+      def date
+      # ↑ INSTANCE METHOD
+      # ↑ PURPOSE: updated date prefer, না থাকলে published date
+
+        if !@entry.updated.nil?
+        # ↑ ! = NOT
+        # ↑ @entry.updated = Feedjira-র updated field
+        # ↑ .nil? = None কি?
+        # ↑ !nil? = "None না" = "আছে"
+          @entry.updated.to_s
+          # ↑ .to_s = to string (DateTime → "2024-01-15 10:30:00 +0000")
+        elsif !@entry.published.nil?
+        # ↑ updated নেই, কিন্তু published আছে?
+          @entry.published.to_s
+        end
+        # ↑ দুটোই nil হলে → implicit nil return
+      end
+
+      def title
+      # ↑ INSTANCE METHOD
+
+        @entry.title.gsub(/#{feed}/i, '').strip
+        # ↑ @entry.title = RSS entry-র title
+        #     Example: "nginx - Critical Security Advisory CVE-2024-001"
+        #
+        # ↑ .gsub() = METHOD: Global SUBstitution (find & replace ALL)
+        #     Python-এ: re.sub(pattern, replacement, string)
+        #
+        # ↑ /#{feed}/i = DYNAMIC REGEX
+        #     #{feed} = feed name (e.g., "nginx") — regex-এ interpolate হচ্ছে
+        #     /i = case insensitive
+        #     তাই regex = /nginx/i
+        #
+        # ↑ '' = replacement: empty string (match মুছে ফেলো)
+        # ↑ .strip = whitespace remove
+        #
+        # ↑ Example:
+        #     "nginx - Critical Security Advisory" 
+        #     → "nginx" remove → " - Critical Security Advisory"
+        #     → strip → "- Critical Security Advisory"
+      end
+
+      def identifier
+      # ↑ INSTANCE METHOD
+        title
+        # ↑ RSS-এ সরাসরি CVE ID available না, তাই title-ই identifier
+      end
+
+      # NOTE: ignore? METHOD override করে না!
+      # তাই Base class-এর ignore? ব্যবহার হয়
+      # Base-এর ignore? = IGNORE_REGEXP (alpha/beta/rc check)
+    end
+  end
+end
+```
+
+---
+
+### File 7: `lib/gulli/feed_entry/dependabot.rb`
+
+```ruby
+require 'gulli/feed_entry/base'
+
+module Gulli
+  module FeedEntry
+    class Dependabot < Base
+    # ↑ Base-এর child class — GitHub Dependabot alert-এর জন্য
+
+
+      def id
+        "#{feed}-#{entry['number']}"
+        # ↑ feed = attr_reader → feed name (e.g., "my-repo")
+        # ↑ entry['number'] = GitHub alert number (e.g., 42)
+        # ↑ Result: "my-repo-42"
+        #
+        # ↑ NOTE: entry হলো Hash (GitHub API response)
+        #     RSSArticle-এ entry হলো Feedjira object
+        #     তাই access style আলাদা:
+        #       Dependabot: entry['number'] (hash)
+        #       RSS: @entry.id (object method)
+      end
+
+      def url
+        entry['html_url']
+        # ↑ GitHub-র web URL, e.g., "https://github.com/owner/repo/security/dependabot/42"
+      end
+
+      def title
+        "#{identifier} - #{summary}"
+        # ↑ e.g., "CVE-2024-001 - SQL injection in login form"
+      end
+
+      def summary
+        entry['security_advisory']['summary']
+        # ↑ NESTED HASH ACCESS
+        # ↑ GitHub API response:
+        #     {"security_advisory": {"summary": "SQL injection..."}}
+      end
+
+      def identifier
+        cve_id || ghsa_id
+        # ↑ || = OR: CVE ID prefer করো, না থাকলে GHSA ID
+        # ↑ cve_id = METHOD (নিচে) — may return nil
+        # ↑ ghsa_id = METHOD (নিচে) — always has value
+        # ↑ Example: CVE-2024-001 || GHSA-xxxx → "CVE-2024-001"
+        # ↑ Example: nil || GHSA-xxxx → "GHSA-xxxx"
+      end
+
+      def ghsa_id
+        entry['security_advisory']['ghsa_id']
+        # ↑ GitHub Security Advisory ID, e.g., "GHSA-xxxx-yyyy-zzzz"
+      end
+
+      def cve_id
+        entry['security_advisory']['cve_id']
+        # ↑ CVE ID, e.g., "CVE-2024-12345" — may be nil
+      end
+
+      def date
+        entry['updated_at']
+        # ↑ alert-এর last update timestamp
+      end
+
+      def ignore?
+        false
+        # ↑ OVERRIDE! Base-এর regex check replace করে
+        # ↑ always false = NEVER ignore security alerts
+        # ↑ কেন? Dependabot alert মানেই security issue — alpha/beta check relevant না
+      end
+    end
+  end
+end
+```
+
+---
+
+### File 8: `lib/gulli/feed_entry/google_artifact_registry.rb`
+
+```ruby
+require 'gulli/feed_entry/base'
+require 'uri'
+
+module Gulli
+  module FeedEntry
+    class GoogleArtifactRegistry < Base
+    # ↑ Base-এর child — Docker image alert-এর জন্য
+
+
+      def id
+        "#{@feed}-#{@entry['image']}"
+        # ↑ @feed = feed name (e.g., "my-docker-image")
+        # ↑ @entry['image'] = image digest (e.g., "sha256:deadbeef123")
+        # ↑ Result: "my-docker-image-sha256:deadbeef123"
+        #
+        # ↑ NOTE: এখানে @feed ব্যবহার করছে (instance variable directly)
+        #     Dependabot-এ feed ব্যবহার করে (attr_reader method)
+        #     দুটোই same result দেয় — style difference
+      end
+
+      def url
+        @entry['url']
+        # ↑ marketplace URL (collector-এ parse_marketplace_url দিয়ে তৈরি)
+      end
+
+      def title
+        "Docker Image Alert: #{@feed} - #{@entry['image']}"
+        # ↑ e.g., "Docker Image Alert: my-image - sha256:deadbeef123"
+      end
+
+      def summary
+        "Docker image #{@feed} has a new tag: #{@entry['image']} uploaded at #{@entry['uploaded_at']}"
+        # ↑ human readable description
+      end
+
+      def identifier
+        @entry['image']
+        # ↑ image digest = identifier
+      end
+
+      def date
+        @entry['uploaded_at']
+        # ↑ formatted upload time (e.g., "2024-01-15 10:30:00 UTC")
+      end
+
+      def ignore?
+        @ignore_updates
+        # ↑ OVERRIDE! Base-এর regex check replace করে
+        # ↑ @ignore_updates = feed config-এর Ignore Updates value
+        # ↑ true → ignore (notification পাঠাবে না)
+        # ↑ false → don't ignore (notification পাঠাবে)
+        # ↑ কেন Base-এর regex ব্যবহার না? Docker image-এর title-এ alpha/beta check relevant না
+      end
+    end
+  end
+end
+```
+
+---
+
+### File 9: `lib/gulli/notify.rb`
+
+```ruby
+require 'slack-notifier'
+# ↑ REQUIRE: Slack webhook client library
+
+module Gulli
+  class Notify
+  # ↑ CLASS: Gulli::Notify
+  # ↑ PURPOSE: Slack-এ message পাঠায়
+  # ↑ সব method class method (self.) — instance বানানো হয় না
+
+
+    def self.article(article)
+    # ↑ CLASS METHOD
+    # ↑ PARAMETER: article = feed entry object
+    # ↑ PURPOSE: নতুন vulnerability পেয়েছি → Slack-এ জানাও
+
+      unless Gulli.config[:slack][:webhook_url]
+      # ↑ unless = "if not"
+      # ↑ webhook_url nil/empty? → ভিতরে যাও
+
+        Gulli.logger.info "No slack webhook URL configured - won't notify"
+        return
+        # ↑ Slack setup না থাকলে → চুপচাপ skip
+      end
+
+      jira_issue_key = article.jira_ticket_link ? article.jira_ticket_link.split('/').last : nil
+      # ↑ LOCAL VARIABLE
+      # ↑ TERNARY EXPRESSION: condition ? true_value : false_value
+      # ↑ Python-এ: x if condition else y
+      # ↑ article.jira_ticket_link = JIRA URL বা nil
+      # ↑ nil না হলে:
+      #     "https://jira.com/browse/PROJ-123".split('/') = ["https:", "", "jira.com", "browse", "PROJ-123"]
+      #     .last = "PROJ-123" (last element)
+      # ↑ nil হলে: nil
+
+      notifier.ping "*#{article.feed}*:\n"\
+                    "<#{article.url}|:inbox_tray: #{article.title}>\n"\
+                    "<#{spreadsheet_url}|:bookmark_tabs: Tracking Spreadsheet>\n"\
+                    "<#{article.jira_ticket_link}|:ticket: #{jira_issue_key}>",
+                    unfurl_links: false
+      # ↑ notifier = CLASS METHOD (নিচে) → Slack client
+      # ↑ .ping = Slack::Notifier METHOD: message পাঠাও
+      # ↑ STRING FORMAT (Slack Markdown):
+      #     *text* = bold
+      #     <url|text> = clickable link
+      #     :emoji_name: = Slack emoji
+      #     \n = newline
+      # ↑ \ (backslash at line end) = LINE CONTINUATION
+      # ↑ unfurl_links: false = KEYWORD ARG: Slack link preview বন্ধ
+    end
+
+
+    def self.feed_error(feed:, url:, error:)
+    # ↑ CLASS METHOD: RSS feed error notification
+    # ↑ ALL KEYWORD ARGS (caller: Notify.feed_error(feed: "nginx", url: "...", error: "..."))
+      notifier.ping "*#{feed}*:\n"\
+                    ":exclamation: #{url} #{error}"
+    end
+
+    def self.repo_error(repo:, msg:)
+    # ↑ CLASS METHOD: generic repo error
+      notifier.ping "*#{Gulli.config[:repo][:owner]}/#{repo}:*\n"\
+                    ":exclamation: #{msg}"
+    end
+
+    def self.dependabot_error(repo:, msg:)
+    # ↑ CLASS METHOD: Dependabot error → just calls repo_error
+      repo_error(repo: repo, msg: msg)
+      # ↑ DELEGATION: আলাদা method name, কিন্তু same code চলে
+      # ↑ কেন আলাদা method? Code-এ কোথায় call হচ্ছে বুঝতে সুবিধা
+    end
+
+    def self.docker_error(repo:, msg:)
+    # ↑ CLASS METHOD: Docker error → also calls repo_error
+      repo_error(repo: repo, msg: msg)
+    end
+
+    def self.fatal(error)
+    # ↑ CLASS METHOD: CRITICAL error — Gulli crash!
+      notifier.ping ":exclamation: <!channel> *Gulli Crashed* (#{error}) :exclamation:"
+      # ↑ <!channel> = Slack special syntax: @channel mention
+      # ↑ team-এর সবাইকে notify করে — "Gulli crash করেছে!"
+    end
+
+
+    def self.notifier
+    # ↑ CLASS METHOD
+    # ↑ RETURNS: Slack::Notifier client (memoized)
+
+      @notifier ||= Slack::Notifier.new(
+      # ↑ @notifier = INSTANCE VARIABLE (class level-এ)
+      # ↑ ||= = MEMOIZATION: একবারই create, পরে reuse
+      # ↑ Slack::Notifier = CLASS from slack-notifier gem
+      # ↑ .new = CONSTRUCTOR
+
+        Gulli.config[:slack][:webhook_url],
+        # ↑ POSITIONAL ARG: Slack webhook URL
+
+        channel: Gulli.config[:slack][:channel],
+        # ↑ KEYWORD ARG: কোন channel-এ পাঠাবে (#general, #security, etc.)
+
+        username: Gulli.config[:slack][:username],
+        # ↑ Bot-এর display name
+
+        icon_emoji: ":#{Gulli.config[:slack][:icon]}:",
+        # ↑ Bot-এর icon, e.g., ":robot_face:"
+      )
+    end
+
+    def self.spreadsheet_url
+    # ↑ CLASS METHOD (helper)
+      "https://docs.google.com/spreadsheets/d/#{Gulli.config[:spreadsheet][:id]}"
+      # ↑ Google Sheet-এর URL তৈরি
+    end
+  end
+end
+```
+
+---
+
+### File 10: `lib/gulli/collect_rss_articles.rb`
+
+```ruby
+require 'gulli/feed_entry/rss_article'
+require 'feedjira'
+# ↑ feedjira = RSS/Atom feed parsing library (Python-এর feedparser)
+
+module Gulli
+  class CollectRSSArticles
+  # ↑ CLASS: RSS feed থেকে articles collect করে
+
+
+    def self.call(feed)
+    # ↑ CLASS METHOD: বাইরে থেকে CollectRSSArticles.call(feed) দিয়ে call
+
+      new(
+      # ↑ CONSTRUCTOR CALL: instance তৈরি
+
+        name: feed[:name],
+        # ↑ feed hash থেকে values বের করে keyword args হিসেবে pass
+        url: feed[:url],
+        ignore_updates: feed[:ignore_updates],
+        create_jira_issue: feed[:auto_jira_issue_create],
+        jira_ticket_assignee: feed[:jira_ticket_assignee],
+      ).call
+      # ↑ .call = INSTANCE METHOD (নিচে defined)
+      # ↑ Pattern: Class.call(args) → Class.new(args).call
+    end
+
+
+    def initialize(name:, url:, ignore_updates:, create_jira_issue:, jira_ticket_assignee:)
+    # ↑ CONSTRUCTOR
+      @name = name
+      # ↑ @ = INSTANCE VARIABLE (Python-এর self.name)
+      @url = url
+      @ignore_updates = ignore_updates
+      @create_jira_issue = create_jira_issue
+      @jira_ticket_assignee = jira_ticket_assignee
+    end
+
+
+    def call
+    # ↑ INSTANCE METHOD
+    # ↑ RETURNS: array of RSSArticle objects
+
+      Gulli.logger.info "#{@name}: Fetching articles from #{@url}"
+
+      xml = fetch_xml
+      # ↑ LOCAL VARIABLE
+      # ↑ fetch_xml = INSTANCE METHOD (নিচে defined)
+      # ↑ returns: XML string বা nil (error হলে)
+
+      return [] unless xml
+      # ↑ GUARD CLAUSE
+      # ↑ unless xml = "xml nil হলে"
+      # ↑ nil → empty array return করো (error case)
+
+      feed = Feedjira.parse(xml)
+      # ↑ LOCAL VARIABLE
+      # ↑ Feedjira = MODULE (RSS parser library)
+      # ↑ .parse(xml) = XML string → parsed feed object
+      # ↑ feed object-এ .entries array থাকে
+
+      feed.entries.map do |entry|
+      # ↑ .entries = parsed feed-এর entry list
+      # ↑ .map = transform each element
+      # ↑ |entry| = current entry (Feedjira object)
+        rss_article_object(entry)
+        # ↑ INSTANCE METHOD (নিচে) → RSSArticle object তৈরি
+      end
+      # ↑ .map-এর result (RSSArticle array) IMPLICIT RETURN
+    end
+
+
+    def rss_article_object(entry)
+    # ↑ INSTANCE METHOD (helper)
+    # ↑ PURPOSE: Feedjira entry → RSSArticle wrapper object
+
+      Gulli::FeedEntry::RSSArticle.new(
+      # ↑ RSSArticle = CLASS (Gulli::FeedEntry::RSSArticle)
+      # ↑ .new = CONSTRUCTOR
+        feed: @name,
+        entry: entry,
+        ignore_updates: @ignore_updates,
+        auto_jira_issue_create: @create_jira_issue,
+        jira_ticket_assignee: @jira_ticket_assignee,
+      )
+    end
+
+
+    def fetch_xml
+    # ↑ INSTANCE METHOD
+    # ↑ RETURNS: XML string বা nil
+    # ↑ PURPOSE: HTTP দিয়ে feed URL থেকে XML download
+
+      client = HTTPClient.new
+      # ↑ LOCAL VARIABLE
+      # ↑ HTTPClient = CLASS (httpclient gem)
+      # ↑ .new = CONSTRUCTOR (HTTP client তৈরি)
+
+      client.ssl_config.set_default_paths
+      # ↑ METHOD CALL: SSL certificate paths fix
+      # ↑ Ruby-র known issue — ছাড়া কিছু HTTPS site error দেয়
+
+      client.get_content @url
+      # ↑ METHOD: HTTP GET request করো
+      # ↑ @url = feed URL
+      # ↑ returns: response body (XML string)
+      # ↑ IMPLICIT RETURN
+
+    rescue HTTPClient::BadResponseError => error
+    # ↑ EXCEPTION HANDLER #1
+    # ↑ BadResponseError = 4xx/5xx HTTP response
+    # ↑ => error = exception variable-এ ধরো
+
+      response = error.res
+      # ↑ .res = exception-এর response object
+      message = "Can't read feed (#{response.status} #{response.reason})"
+      Gulli.logger.error "#{@name}: #{message}"
+      Gulli::Notify.feed_error feed: @name, url: @url, error: message
+      nil
+      # ↑ RETURN nil → caller-এ `return [] unless xml` handle করবে
+
+    rescue => error
+    # ↑ EXCEPTION HANDLER #2 (catch-all)
+    # ↑ rescue => (class ছাড়া) = catch all StandardError
+    # ↑ Python-এ: except Exception as error:
+
+      message = "Can't read feed (#{error})"
+      Gulli.logger.error "#{@name}: #{message}"
+      Gulli::Notify.feed_error feed: @name, url: @url, error: message
+      nil
+    end
+  end
+end
+```
+
+---
+
+### File 11: `lib/gulli/collect_dependabot_alerts.rb`
+
+```ruby
+require 'gulli/feed_entry/dependabot'
+
+module Gulli
+  class CollectDependabotAlerts
+  # ↑ CLASS: GitHub Dependabot alerts collect করে
+
+
+    def self.call(feed)
+      new(feed).call
+      # ↑ feed hash directly pass (destructure না করে)
+    end
+
+    def initialize(feed)
+      @name = feed[:name]
+      @ignore_updates = feed[:ignore_updates]
+      @create_jira_issue = feed[:auto_jira_issue_create]
+      @jira_ticket_assignee = feed[:jira_ticket_assignee]
+    end
+
+
+    def call
+      Gulli.logger.info "Github Repo: Fetching dependabot alerts for #{@name}"
+
+      unless configured?
+      # ↑ unless = if not
+      # ↑ configured? = PRIVATE METHOD (নিচে)
+        notify_dependabot_error('Missing Configuration')
+        return []
+      end
+
+      dependabot_alerts.map do |entry|
+      # ↑ dependabot_alerts = PRIVATE METHOD: GitHub API call
+      # ↑ returns: array of alert hashes
+        dependabot_article_object(entry)
+      end
+    end
+
+    private
+    # ↑ VISIBILITY MODIFIER
+    # ↑ এর নিচের সব method PRIVATE (বাইরে থেকে call করা যাবে না)
+    # ↑ Python-এ: _ prefix convention (e.g., _dependabot_alerts)
+
+
+    def dependabot_article_object(entry)
+    # ↑ PRIVATE METHOD
+      Gulli::FeedEntry::Dependabot.new(
+        feed: @name,
+        entry: entry,
+        ignore_updates: @ignore_updates,
+        auto_jira_issue_create: @create_jira_issue,
+        jira_ticket_assignee: @jira_ticket_assignee,
+      )
+    end
+
+    def dependabot_alerts
+    # ↑ PRIVATE METHOD
+    # ↑ RETURNS: array of alert hashes (from GitHub API)
+
+      response = HTTPClient.new.get(url, query_params, headers)
+      # ↑ HTTP GET to GitHub API
+      # ↑ url, query_params, headers = PRIVATE METHODS (নিচে)
+
+      alerts = JSON.parse response.body
+      # ↑ JSON.parse = JSON string → Ruby Hash/Array
+      # ↑ Python-এ: json.loads(response.text)
+
+      unless response.status == 200
+      # ↑ 200 না? → error!
+        notify_dependabot_error(alerts['message'])
+        return []
+      end
+
+      alerts
+      # ↑ IMPLICIT RETURN: array of alert hashes
+    end
+
+    def configured?
+    # ↑ PRIVATE METHOD, ? = boolean
+      Gulli.config[:repo][:owner] && Gulli.config[:repo][:token]
+      # ↑ && = AND: দুটোই set থাকতে হবে
+    end
+
+    def notify_dependabot_error(msg)
+      Gulli::Notify.dependabot_error(repo: @name, msg: msg)
+    end
+
+    def url
+      "https://api.github.com/repos/#{Gulli.config[:repo][:owner]}/#{repo_name}/dependabot/alerts"
+      # ↑ GitHub REST API endpoint
+    end
+
+    def repo_name
+      @name.strip
+    end
+
+    def query_params
+      { state: ['open'] }
+      # ↑ শুধু open (unfixed) alerts চাই
+    end
+
+    def headers
+      {
+        Accept: 'application/vnd.github+json',
+        Authorization: "Bearer #{Gulli.config[:repo][:token]}",
+        # ↑ Bearer token authentication
+        'X-GitHub-Api-Version': '2022-11-28',
+      }
+    end
+  end
+end
+```
+
+---
+
+### File 12: `lib/gulli/collect_google_artifact_registry_alerts.rb`
+
+```ruby
+require 'open3'       # ↑ External command (unused here — legacy code)
+require 'json'
+require 'httpclient'
+require 'gulli/feed_entry/google_artifact_registry'
+
+module Gulli
+  class CollectGoogleArtifactRegistryAlerts
+  # ↑ CLASS: Docker image registry alerts collect করে
+
+
+    def self.call(feed)
+      new(feed).call
+    end
+
+    def initialize(feed)
+      @url = feed[:url]
+      @name = feed[:name]
+      @ignore_updates = feed[:ignore_updates]
+      @create_jira_issue = feed[:auto_jira_issue_create]
+      @jira_ticket_assignee = feed[:jira_ticket_assignee]
+    end
+
+
+    def call
+      Gulli.logger.info "Fetching docker alerts for #{@name}"
+      unless configured?
+        notify_docker_error('Missing Configuration')
+        return []
+      end
+
+      parse_and_filter_image_data.map do |entry|
+        google_artifact_article_object(entry)
+      end
+    end
+
+    private
+
+
+    def google_artifact_article_object(entry)
+      Gulli::FeedEntry::GoogleArtifactRegistry.new(
+        feed: @name,
+        entry: entry,
+        ignore_updates: @ignore_updates,
+        auto_jira_issue_create: @create_jira_issue,
+        jira_ticket_assignee: @jira_ticket_assignee,
+      )
+    end
+
+    def configured?
+      Gulli.config[:google][:keyfile]
+      # ↑ keyfile path set আছে? (truthy check)
+    end
+
+    def notify_docker_error(msg)
+      Gulli::Notify.docker_error(repo: @name, msg: msg)
+    end
+
+
+    def fetch_image_data
+    # ↑ PRIVATE METHOD: Google API call
+
+      response = HTTPClient.new.get(url, nil, headers)
+      # ↑ url = ATTR_READER (নিচে)
+      # ↑ nil = no query params
+      # ↑ headers = PRIVATE METHOD with OAuth2 token
+
+      handle_bad_response(response)
+      # ↑ error check → fail হলে exception raise
+
+      JSON.parse(response.body)
+
+    rescue StandardError => error
+      handle_unexpected_error(error)
+    end
+
+    def handle_bad_response(response)
+      return if response.status < 400
+      # ↑ 200-399 = OK → কিছু করো না, return
+
+      notify_docker_error("Error fetching image info: Status #{response.status}: #{response.body}")
+      fail "HTTP error: #{response.status}"
+      # ↑ fail = KEYWORD: exception raise করো (= raise in Python)
+    end
+
+    def handle_unexpected_error(error)
+      notify_docker_error("Unexpected error: #{error.message}")
+      fail error
+      # ↑ fail error = same exception আবার raise (re-raise)
+    end
+
+
+    def parse_and_filter_image_data
+    # ↑ PRIVATE METHOD: মূল logic
+
+      data = fetch_image_data
+      # ↑ API call → response data
+
+      return [] unless valid_image_data?(data)
+      # ↑ valid না? → empty array
+
+      digest, info = find_latest_image(data['manifest'])
+      # ↑ MULTIPLE ASSIGNMENT (Python-এও same: a, b = func())
+      # ↑ digest = image hash (e.g., "sha256:deadbeef")
+      # ↑ info = manifest info (tags, upload time, etc.)
+
+      return [] unless digest && info
+      # ↑ "latest" tag পাওয়া যায়নি → empty
+
+      build_alert_entry(digest, info)
+    end
+
+    def headers
+      { 'Authorization' => "Bearer #{fetch_google_access_token}" }
+      # ↑ OAuth2 Bearer token
+    end
+
+    attr_reader :url
+    # ↑ ATTR_READER: @url-এর getter method auto-generate
+    # ↑ effectively: def url; @url; end
+
+
+    def fetch_google_access_token
+    # ↑ PRIVATE METHOD
+    # ↑ PURPOSE: keyfile.json → Google API access token
+
+      scope = ['https://www.googleapis.com/auth/cloud-platform']
+
+      authorizer = Google::Auth::ServiceAccountCredentials.make_creds(
+        json_key_io: File.open(Gulli.config[:google][:keyfile]),
+        # ↑ তোমার keyfile.json!
+        scope: scope,
+      )
+
+      authorizer.fetch_access_token!['access_token']
+      # ↑ .fetch_access_token! = Google-এ network call করে token আনে
+      # ↑ ! = side effect (network call)
+      # ↑ returns: {"access_token" => "ya29.xxx..."} hash
+      # ↑ ['access_token'] = hash থেকে token string বের করো
+    end
+
+
+    def valid_image_data?(image_data)
+      image_data.is_a?(Hash) && image_data['manifest'].is_a?(Hash)
+      # ↑ .is_a?(Hash) = TYPE CHECK (Python-এ: isinstance(x, dict))
+    end
+
+    def find_latest_image(manifests)
+    # ↑ PURPOSE: "latest" tag-ওয়ালা image খোঁজো
+
+      manifests.detect { |_, m| m['tag'].include?('latest') }
+      # ↑ .detect = METHOD (= .find)
+      #     প্রথম match পেলে return, না পেলে nil
+      # ↑ { |_, m| ... } = BLOCK
+      #     |_, m| = 2 PARAMS: key (ignored with _), value
+      #     _ = convention: "এই value দরকার নেই, ignore করো"
+      # ↑ m['tag'] = tag array, e.g., ["latest", "v1.0"]
+      # ↑ .include?('latest') = "latest" আছে কি?
+    end
+
+    def build_alert_entry(digest, info)
+      [{
+        'image' => digest,
+        'uploaded_at' => format_uploaded_time(info),
+        'url' => parse_marketplace_url(@url),
+      }]
+      # ↑ Array with single Hash
+      # ↑ .map দিয়ে process করার জন্য array-তে wrap
+    end
+
+    def format_uploaded_time(info)
+      Time.at(info['timeUploadedMs'].to_i / 1000).utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+      # ↑ info['timeUploadedMs'] = "1705312200000" (milliseconds string)
+      # ↑ .to_i = string → integer
+      # ↑ / 1000 = milliseconds → seconds
+      # ↑ Time.at(seconds) = Unix timestamp → Time object
+      # ↑ .utc = UTC timezone-এ convert
+      # ↑ .strftime = format → "2024-01-15 10:30:00 UTC"
+    end
+
+    def parse_marketplace_url(feed)
+    # ↑ API URL → readable URL
+
+      uri = URI.parse(feed)
+      path_parts = uri.path.split('/')
+      host = uri.host
+      owner = path_parts[2]
+      repo = path_parts[3]
+      "#{host}/#{owner}/#{repo}"
+      # ↑ "https://gcr.io/v2/google/image/tags/list" → "gcr.io/google/image"
+
+    rescue StandardError
+      feed
+      # ↑ error হলে original URL return
+    end
+  end
+end
+```
+
+---
+
+### File 13: `lib/gulli/jira_ticket_creator.rb`
+
+```ruby
+require_relative '../utility/assessment_due_date_generator'
+# ↑ require_relative = RELATIVE PATH require
+# ↑ ../ = one directory up
+# ↑ Python-এ: from ..utility.assessment_due_date_generator import ...
+
+module Gulli
+  class JiraTicketCreator
+  # ↑ CLASS: JIRA REST API দিয়ে ticket create
+
+    include ::Utility::AssessmentDueDateGenerator
+    # ↑ INCLUDE = MIXIN
+    # ↑ :: prefix = top-level namespace (Gulli-র বাইরের Utility module)
+    # ↑ PURPOSE: AssessmentDueDateGenerator module-এর assessment_due_date method
+    #   এই class-এও available হয়ে যায়
+    # ↑ Python-এ: class JiraTicketCreator(AssessmentDueDateGeneratorMixin):
+
+    attr_reader :article
+    # ↑ GETTER: @article পড়ার method
+
+    JIRA_FIELD_FEED = 'customfield_11488'.freeze
+    JIRA_FIELD_URL = 'customfield_11489'.freeze
+    JIRA_FIELD_PROJECT_NAME = 'customfield_11490'.freeze
+    JIRA_ASSESSMENT_DUE_DATE = 'customfield_11856'.freeze
+    # ↑ CONSTANTS: JIRA custom field IDs
+    # ↑ JIRA-র প্রতিটা custom field-এর unique ID থাকে
+
+
+    def self.call(article:)
+    # ↑ CLASS METHOD
+    # ↑ article: = KEYWORD ARG
+      new(article: article).call
+    end
+
+    def initialize(article:)
+      @article = article
+    end
+
+
+    def call
+    # ↑ INSTANCE METHOD
+    # ↑ RETURNS: ticket URL string বা nil
+
+      response = http_client.post("#{jira_base_url}/rest/api/3/issue?skipAutoWatch=true", payload.to_json)
+      # ↑ http_client = INSTANCE METHOD (নিচে) — configured HTTP client
+      # ↑ .post(url, body) = HTTP POST request
+      # ↑ JIRA REST API v3 endpoint
+      # ↑ payload = INSTANCE METHOD (নিচে) — request body hash
+      # ↑ .to_json = Hash → JSON string
+
+      if response.status == 201
+      # ↑ 201 = Created (success!)
+        result = JSON.parse(response.body)
+        "#{jira_base_url}/browse/#{result['key']}"
+        # ↑ IMPLICIT RETURN: ticket URL
+        # ↑ result['key'] = "PROJ-123"
+        # ↑ Final: "https://jira.com/browse/PROJ-123"
+      else
+        Gulli::Notify.fatal(
+          '[Action Required] Create VA ticket manually because Jira API call ' \
+          "failed for #{article.title} with error: #{response.body}",
+        )
+        # ↑ Slack-এ "manually ticket বানাও" message
+        nil
+        # ↑ RETURN nil (fail)
+      end
+
+    rescue StandardError => error
+      Gulli::Notify.fatal(
+        '[Action Required] Create VA ticket manually because Jira API call ' \
+        "failed for #{article.title} with error: #{error}",
+      )
+      nil
+    end
+
+
+    def payload
+    # ↑ INSTANCE METHOD: JIRA issue creation request body
+
+      {
+        fields: {
+          project: { key: jira_project_key },
+          reporter: { accountId: article.jira_ticket_assignee },
+          summary: article.title,
+          issuetype: { name: jira_issue_type },
+          assignee: { accountId: article.jira_ticket_assignee },
+
+          JIRA_ASSESSMENT_DUE_DATE => assessment_due_date,
+          # ↑ CONSTANT as hash key → evaluates to 'customfield_11856'
+          # ↑ assessment_due_date = METHOD from included mixin
+          #   returns: "2024-01-16"
+
+          JIRA_FIELD_FEED => article.feed,
+          JIRA_FIELD_URL => article.url,
+          JIRA_FIELD_PROJECT_NAME => { value: jira_project_name },
+        }.compact,
+        # ↑ .compact = METHOD: nil values remove করো
+        # ↑ Python-এ: {k: v for k, v in d.items() if v is not None}
+      }
+    end
+
+
+    def http_client
+    # ↑ INSTANCE METHOD: configured HTTP client (memoized)
+
+      @http_client ||= begin
+        client = HTTPClient.new
+        client.default_header = {
+          'Authorization' => "Basic #{auth_token}",
+          # ↑ Basic Auth header
+          'Content-Type' => 'application/json',
+          'Accept' => 'application/json',
+        }
+        client.cookie_manager = nil
+        # ↑ Cookie management বন্ধ
+        client
+      end
+    end
+
+    def auth_token
+    # ↑ INSTANCE METHOD: Base64 encoded credentials
+
+      @auth_token ||= Base64.strict_encode64("#{jira_username}:#{jira_api_token}")
+      # ↑ Base64 = STDLIB MODULE
+      # ↑ .strict_encode64 = encode without line breaks
+      # ↑ "user:token" → "dXNlcjp0b2tlbg=="
+    end
+
+    # Helper methods — সব config থেকে value পড়ে
+    def jira_base_url
+      Gulli.config[:jira][:base_url]
+    end
+    def jira_project_key
+      Gulli.config[:jira][:project_key]
+    end
+    def jira_issue_type
+      Gulli.config[:jira][:issue_type]
+    end
+    def jira_username
+      Gulli.config[:jira][:username]
+    end
+    def jira_api_token
+      Gulli.config[:jira][:api_token]
+    end
+    def jira_project_name
+      Gulli.config[:jira][:project_name]
+    end
+  end
+end
+```
+
+---
+
+### File 14: `lib/utility/assessment_due_date_generator.rb`
+
+```ruby
+require 'date'
+
+module Utility
+# ↑ MODULE: Gulli-র বাইরে, top-level namespace
+
+  module AssessmentDueDateGenerator
+  # ↑ MODULE: Mixin module — অন্য class-এ include করার জন্য
+  # ↑ Python-এ: Mixin class
+
+    DHAKA_OFFSET = '+06:00'.freeze
+    # ↑ CONSTANT: Bangladesh timezone (UTC+6)
+
+    CUTOFF_HOUR = 10
+    # ↑ CONSTANT: সকাল ১০টা
+
+
+    def assessment_due_date
+    # ↑ INSTANCE METHOD (include করলে host class-এর instance method হয়)
+    # ↑ RETURNS: "YYYY-MM-DD" string
+    # ↑ PURPOSE: JIRA ticket-এর assessment due date বের করো
+
+      today = Time.now.localtime(DHAKA_OFFSET)
+      # ↑ Time.now = UTC time এখন
+      # ↑ .localtime('+06:00') = Dhaka timezone-এ convert
+
+      date = Date.new(today.year, today.month, today.day)
+      # ↑ শুধু date part (time বাদ)
+
+      cutoff_time = Time.new(today.year, today.month, today.day, CUTOFF_HOUR, 0, 0, DHAKA_OFFSET)
+      # ↑ আজকে সকাল ১০:০০:০০ BD time
+
+      due_date = if today < cutoff_time
+      # ↑ IF AS EXPRESSION — Ruby-তে if value return করতে পারে!
+      # ↑ Python-এ: due_date = date if now.hour < 10 else next_day
+
+                   date
+                   # ↑ ১০টার আগে → আজকের date
+
+                 else
+                   next_day = date + 1
+                   # ↑ Date + Integer = দিন add
+                   # ↑ Python-এ: date + timedelta(days=1)
+
+                   next_day += 1 if next_day.saturday?
+                   # ↑ .saturday? = METHOD: শনিবার কি?
+                   # ↑ শনিবার হলে আরো ১ দিন → রবিবার
+                   # ↑ (শুক্রবার skip করে না — সম্ভবত BD context-এ শুক্র ছুটি কিন্তু
+                   #    শনিবার half-day, তাই skip)
+
+                   next_day
+                   # ↑ else block-এর return value
+                 end
+
+      due_date.strftime('%Y-%m-%d')
+      # ↑ .strftime = date → formatted string
+      # ↑ "2024-01-16"
+    end
+  end
+end
+```
+
+---
+
+## সংক্ষেপে — তোমার ৪টা প্রশ্নের উত্তর:
+
+### ১. "পুরনো/known ignore কিভাবে?"
+- **File:** `lib/gulli.rb` → `handle_announcement` → `already_known_or_old?`
+- **File:** `lib/gulli/feed_entry/base.rb` → `known?` method
+- **How:** Google Sheet-এর Data tab-এ article-এর ID খোঁজে। পেলে → skip। না পেলে → নতুন!
+
+### ২. "Duplicate notification কিভাবে আটকায়?"
+- **`remember!`** method → Sheet-এ ID save করে
+- পরেরবার **`known?`** → সেই ID Sheet-এ পায় → skip
+- **ID unique** — প্রতিটা article type আলাদা ভাবে ID বানায়
+
+### ৩. "`?` কী?"
+- **শুধু method name-এর অংশ** — কোনো special syntax না
+- **Convention:** `?` মানে method true/false return করে
+- **`!`** মানে method কিছু change/modify করে
+
+### ৪. "Data flow?"
+```
+Sheet(Feeds tab) → feed list → collector(RSS/Dependabot/GAR) 
+→ articles → known? check(Sheet Data tab) → নতুন হলে → 
+Sheet-এ save + JIRA + Slack
+```
+
+
+
+
+
+# Gulli কী Format-এ Data চায়? — Complete Analysis
+
+## Step 1: Gulli-র Input-Output বুঝি
+
+Gulli-র দুইটা পথ আছে data আসার:
+
+```
+INPUT PATH 1: Google Sheet "Feeds" tab (তুমি manually লেখো)
+    ↓
+    Gulli পড়ে → কোন feed monitor করবে
+
+INPUT PATH 2: External Sources (Gulli automatically fetch করে)
+    ├── RSS feed URL → XML data
+    ├── GitHub API → JSON data
+    └── Google Artifact Registry API → JSON data
+    ↓
+    Gulli parse করে → articles/alerts
+    ↓
+OUTPUT: Google Sheet "Data" tab (Gulli লেখে)
+```
+
+---
+
+## Step 2: Feeds Tab — Input Format (তুমি এখানে লেখো)
+
+**File: `lib/gulli/fetch_feeds.rb`**, `feed_hash` method থেকে বুঝি:
+
+```ruby
+{
+  name: row.fetch('Name'),
+  url: row.fetch('URL'),
+  ignore_updates: (row.fetch('Ignore Updates', false) == TRUE_VALUE),
+  type: feed_type.strip,
+  auto_jira_issue_create: (row.fetch("Don't Create Jira Issue", false) == FALSE_VALUE),
+  jira_ticket_assignee: row.fetch('story_assignee'),
+}
+```
+
+**মানে Sheet-এর Feeds tab-এ এই columns লাগবে:**
+
+| Column | Header Name | Required? | Example Value | কী করে |
+|--------|------------|-----------|---------------|--------|
+| A | Name | ✅ হ্যাঁ | `nginx` | feed-এর নাম (unique identifier) |
+| B | URL | ✅ হ্যাঁ | `https://nginx.org/feed.xml` | data কোথা থেকে আনবে |
+| C | Type | ❌ (default: rss) | `rss` বা `dependabot` বা `google-artifact-registry` | কোন collector ব্যবহার হবে |
+| D | Ignore Updates | ❌ (default: FALSE) | `TRUE` বা `FALSE` | TRUE হলে শুধু নতুন entry track করে, update ignore করে |
+| E | Don't Create Jira Issue | ❌ (default: FALSE) | `TRUE` বা `FALSE` | FALSE মানে JIRA ticket বানাও (double negative!) |
+| F | story_assignee | ❌ | `john123` | JIRA ticket কাকে assign হবে |
+
+---
+
+## Step 3: Data Tab — Output Format (Gulli এখানে লেখে)
+
+**File: `lib/gulli/feed_entry/base.rb`**, `remember!` method থেকে বুঝি:
+
+```ruby
+def remember!
+  Gulli::Spreadsheet.append(
+    Gulli.config[:spreadsheet][:ranges][:data],
+    attributes: [feed, id, identifier, url, ignore?, date, jira_ticket_link],
+    #             A      B    C          D    E       F      G
+  )
+end
+```
+
+**Data tab-এর columns:**
+
+| Column | Header Name | Example Value | কোথা থেকে আসে |
+|--------|------------|---------------|----------------|
+| A | feed | `nginx` | feed name |
+| B | id | `nginx-CVE-2024-001` | unique ID (type অনুযায়ী আলাদা) |
+| C | identifier | `CVE-2024-001` | CVE ID, title, বা image digest |
+| D | url | `https://nginx.org/advisory/...` | article/alert URL |
+| E | ignore | `false` | ignore? method-এর result |
+| F | last_updated | `2024-01-15` | article-এর date |
+| G | jira_ticket_link | `https://jira.com/browse/PROJ-123` | JIRA ticket URL বা blank |
+
+---
+
+## Step 4: প্রতিটা Collector কী Format-এ Data Process করে?
+
+### Format A: RSS (`type: "rss"`)
+
+**Input:** RSS/Atom XML feed
+**Collector:** `CollectRSSArticles`
+**Entry Class:** `FeedEntry::RSSArticle`
+
+```
+RSS feed XML → Feedjira parse → RSSArticle object
+```
+
+**RSSArticle object-এর fields:**
+```ruby
+id         = @entry.id           # RSS <guid> বা Atom <id>
+             # Example: "https://nginx.org/advisory/2024-001"
+
+url        = @entry.url          # article link
+             # Example: "https://nginx.org/en/security_advisory.html"
+
+title      = @entry.title minus feed name
+             # Example: "nginx Security Advisory" → "Security Advisory"
+
+identifier = title               # RSS-এ CVE ID সরাসরি নেই
+
+date       = @entry.updated বা @entry.published
+             # Example: "2024-01-15 10:30:00 +0000"
+
+ignore?    = title regex check (alpha/beta/rc?)
+             # "1.0-rc1" → true, "1.0" → false
+```
+
+---
+
+### Format B: Dependabot (`type: "dependabot"`)
+
+**Input:** GitHub REST API JSON response
+**Collector:** `CollectDependabotAlerts`
+**Entry Class:** `FeedEntry::Dependabot`
+
+**GitHub API Response Format (যেটা Gulli expect করে):**
+```json
+[
+  {
+    "number": 42,
+    "html_url": "https://github.com/owner/repo/security/dependabot/42",
+    "updated_at": "2024-01-15T10:30:00Z",
+    "security_advisory": {
+      "ghsa_id": "GHSA-xxxx-yyyy-zzzz",
+      "cve_id": "CVE-2024-12345",
+      "summary": "SQL injection vulnerability in login form"
+    }
+  }
+]
+```
+
+**Dependabot object-এর fields:**
+```ruby
+id         = "#{feed}-#{entry['number']}"
+             # Example: "my-repo-42"
+
+url        = entry['html_url']
+             # Example: "https://github.com/owner/repo/security/dependabot/42"
+
+title      = "#{identifier} - #{summary}"
+             # Example: "CVE-2024-12345 - SQL injection vulnerability in login form"
+
+identifier = cve_id || ghsa_id
+             # CVE prefer, fallback GHSA
+
+date       = entry['updated_at']
+             # Example: "2024-01-15T10:30:00Z"
+
+ignore?    = false  (always)
+```
+
+---
+
+### Format C: Google Artifact Registry (`type: "google-artifact-registry"`)
+
+**Input:** Google Container Registry API JSON
+**Collector:** `CollectGoogleArtifactRegistryAlerts`
+**Entry Class:** `FeedEntry::GoogleArtifactRegistry`
+
+**Google API Response Format:**
+```json
+{
+  "manifest": {
+    "sha256:deadbeef123": {
+      "tag": ["latest", "v1.0"],
+      "timeUploadedMs": "1705312200000"
+    },
+    "sha256:abc456": {
+      "tag": ["v0.9"],
+      "timeUploadedMs": "1705000000000"
+    }
+  }
+}
+```
+
+**Collector internally builds:**
+```ruby
+entry = {
+  'image'       => 'sha256:deadbeef123',
+  'uploaded_at' => '2024-01-15 10:30:00 UTC',
+  'url'         => 'gcr.io/google/awesome-image'
+}
+```
+
+**GoogleArtifactRegistry object-এর fields:**
+```ruby
+id         = "#{feed}-#{entry['image']}"
+             # Example: "my-image-sha256:deadbeef123"
+
+url        = entry['url']
+             # Example: "gcr.io/google/awesome-image"
+
+title      = "Docker Image Alert: #{feed} - #{entry['image']}"
+
+identifier = entry['image']
+             # "sha256:deadbeef123"
+
+date       = entry['uploaded_at']
+             # "2024-01-15 10:30:00 UTC"
+
+ignore?    = @ignore_updates (feed config থেকে)
+```
+
+---
+
+## Step 5: Gulli যেটা আসলে চায় — Common Interface
+
+**সব article type-এর একটা common interface আছে (Base class define করে):**
+
+```
+যেকোনো article object-কে Gulli handle করতে এই methods লাগে:
+
+article.id                         → unique string (duplicate check-এর জন্য)
+article.url                        → string (link to the vulnerability)
+article.title                      → string (human readable title)
+article.identifier                 → string (CVE ID, title, or digest)
+article.feed                       → string (feed name)
+article.date                       → string (date, parseable by DateTime.parse)
+article.ignore?                    → boolean (should we skip notification?)
+article.known?                     → boolean (already in sheet?)
+article.published_date_before_6_months? → boolean (too old?)
+article.auto_jira_issue_create?    → boolean (should we create jira?)
+article.jira_ticket_assignee       → string or nil (jira user ID)
+article.jira_ticket_link           → string or nil (jira ticket URL)
+article.remember!                  → void (save to sheet)
+article.create_jira_ticket!        → void (create jira ticket)
+```
+
+---
+
+## Step 6: 🔥 Renovate Integration — কী করতে হবে?
+
+Renovate report-কে Gulli-তে integrate করতে **দুইটা approach** আছে:
+
+### Approach A: নতুন Feed Type তৈরি করো (Recommended ✅)
+
+**ধাপ ১:** নতুন Collector class বানাও
+
+```ruby
+# lib/gulli/collect_renovate_alerts.rb
+
+module Gulli
+  class CollectRenovateAlerts
+    def self.call(feed)
+      new(feed).call
+    end
+
+    def initialize(feed)
+      @name = feed[:name]
+      @url = feed[:url]  # Renovate report URL or file path
+      @ignore_updates = feed[:ignore_updates]
+      @create_jira_issue = feed[:auto_jira_issue_create]
+      @jira_ticket_assignee = feed[:jira_ticket_assignee]
+    end
+
+    def call
+      # Renovate report পড়ো → parse করো → entry objects বানাও
+      renovate_data = fetch_renovate_report
+      renovate_data.map do |entry|
+        Gulli::FeedEntry::Renovate.new(
+          feed: @name,
+          entry: entry,
+          ignore_updates: @ignore_updates,
+          auto_jira_issue_create: @create_jira_issue,
+          jira_ticket_assignee: @jira_ticket_assignee,
+        )
+      end
+    end
+
+    def fetch_renovate_report
+      # তোমার Renovate report parse logic এখানে
+      # JSON file read, API call, etc.
+    end
+  end
+end
+```
+
+**ধাপ ২:** নতুন Feed Entry class বানাও
+
+```ruby
+# lib/gulli/feed_entry/renovate.rb
+
+module Gulli
+  module FeedEntry
+    class Renovate < Base
+
+      def id
+        "#{@feed}-#{@entry['package']}-#{@entry['new_version']}"
+        # Example: "my-project-lodash-4.17.21"
+      end
+
+      def url
+        @entry['url'] || @entry['changelog_url'] || ''
+      end
+
+      def title
+        "#{@entry['package']} #{@entry['current_version']} → #{@entry['new_version']}"
+        # Example: "lodash 4.17.20 → 4.17.21"
+      end
+
+      def identifier
+        "#{@entry['package']}-#{@entry['new_version']}"
+      end
+
+      def date
+        @entry['timestamp'] || Time.now.to_s
+      end
+
+      def ignore?
+        !!(title =~ IGNORE_REGEXP)
+        # Base-এর regex ব্যবহার করো (alpha/beta/rc filter)
+        # অথবা override করো তোমার logic অনুযায়ী
+      end
+    end
+  end
+end
+```
+
+**ধাপ ৩:** Registry-তে register করো
+
+```ruby
+# lib/gulli.rb এ add করো:
+
+require 'gulli/collect_renovate_alerts'
+
+FEED_ENTRY_COLLECTOR = {
+  'rss' => Gulli::CollectRSSArticles,
+  'dependabot' => Gulli::CollectDependabotAlerts,
+  'google-artifact-registry' => Gulli::CollectGoogleArtifactRegistryAlerts,
+  'renovate' => Gulli::CollectRenovateAlerts,     # ← এটা add করো
+}.freeze
+```
+
+**ধাপ ৪:** Feeds tab-এ entry add করো
+
+| Name | URL | Type | Ignore Updates | Don't Create Jira Issue | story_assignee |
+|------|-----|------|---------------|------------------------|----------------|
+| my-project | https://api.github.com/repos/owner/repo/renovate-report.json | **renovate** | FALSE | FALSE | john123 |
+
+---
+
+### Approach B: Renovate Report → Gulli-র Expected Format-এ Convert
+
+Renovate report যেমনই আসুক, তোমাকে এই format-এ convert করতে হবে:
+
+```
+Gulli-র Collector expect করে: Array of entry hashes
+
+প্রতিটা entry hash-এ যা থাকতে হবে:
+(তুমি entry class-এ কোন key access করো সেটার উপর depend করে)
+```
+
+**Renovate report (typical JSON format):**
+```json
+{
+  "packageRules": [...],
+  "updates": [
+    {
+      "depName": "lodash",
+      "currentVersion": "4.17.20",
+      "newVersion": "4.17.21",
+      "updateType": "patch",
+      "datasource": "npm",
+      "changelogUrl": "https://github.com/lodash/lodash/compare/4.17.20...4.17.21",
+      "vulnerabilityAlerts": {
+        "CVE-2024-001": {
+          "severity": "high",
+          "description": "Prototype pollution"
+        }
+      }
+    },
+    {
+      "depName": "express",
+      "currentVersion": "4.18.0",
+      "newVersion": "5.0.0-beta.1",
+      "updateType": "major",
+      "datasource": "npm"
+    }
+  ]
+}
+```
+
+**Collector-এ parse করে Gulli-friendly hash বানাও:**
+```ruby
+def fetch_renovate_report
+  # Renovate JSON পড়ো
+  report = JSON.parse(HTTPClient.new.get_content(@url))
+
+  # Gulli-friendly format-এ convert করো
+  report['updates'].map do |update|
+    {
+      'package'         => update['depName'],
+      'current_version' => update['currentVersion'],
+      'new_version'     => update['newVersion'],
+      'update_type'     => update['updateType'],
+      'url'             => update['changelogUrl'],
+      'timestamp'       => Time.now.to_s,
+      'vulnerabilities' => update['vulnerabilityAlerts'],
+    }
+  end
+end
+```
+
+**তারপর Entry class-এ সেই hash access করো:**
+```ruby
+class Renovate < Base
+  def id
+    "#{@feed}-#{@entry['package']}-#{@entry['new_version']}"
+  end
+
+  def title
+    "#{@entry['package']} #{@entry['current_version']} → #{@entry['new_version']} (#{@entry['update_type']})"
+  end
+
+  # ... etc
+end
+```
+
+---
+
+## Step 7: Data Format Summary — এক নজরে
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    GULLI DATA FORMAT                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  FEEDS TAB (Input — তুমি লেখো):                                │
+│  ┌──────┬──────────────┬──────────┬────────────┬────────┬─────┐│
+│  │ Name │ URL          │ Type     │ Ignore     │ Don't  │story││
+│  │      │              │          │ Updates    │ Create ││    ││
+│  │      │              │          │            │ Jira   ││    ││
+│  ├──────┼──────────────┼──────────┼────────────┼────────┼─────┤│
+│  │nginx │https://...   │rss       │FALSE       │FALSE   │     ││
+│  │repo1 │              │dependabot│FALSE       │FALSE   │john ││
+│  │image1│https://gcr...│google-ar.│FALSE       │TRUE    │     ││
+│  │proj1 │https://...   │renovate  │FALSE       │FALSE   │jane ││ ← নতুন!
+│  └──────┴──────────────┴──────────┴────────────┴────────┴─────┘│
+│                                                                 │
+│  COLLECTOR picks based on Type:                                 │
+│  "rss"       → CollectRSSArticles → RSSArticle                 │
+│  "dependabot"→ CollectDependabotAlerts → Dependabot             │
+│  "google-ar."→ CollectGoogleArtifactRegistryAlerts → GAR        │
+│  "renovate"  → CollectRenovateAlerts → Renovate  ← নতুন!       │
+│                                                                 │
+│  EVERY ARTICLE MUST HAVE:                                       │
+│  ┌──────────┬──────────────────────────────────────────────┐    │
+│  │ Method   │ Returns                                      │    │
+│  ├──────────┼──────────────────────────────────────────────┤    │
+│  │ id       │ unique string (e.g., "nginx-CVE-2024-001")  │    │
+│  │ url      │ link string                                  │    │
+│  │ title    │ human readable string                        │    │
+│  │ identifier│ CVE ID, package name, etc.                  │    │
+│  │ feed     │ feed name string                             │    │
+│  │ date     │ date string (DateTime.parse parseable)       │    │
+│  │ ignore?  │ true/false                                   │    │
+│  └──────────┴──────────────────────────────────────────────┘    │
+│                                                                 │
+│  DATA TAB (Output — Gulli লেখে):                               │
+│  ┌──────┬──────────────────┬───────────┬────┬──────┬──────┬────┐│
+│  │ feed │ id               │identifier │url │ignore│date  │jira││
+│  ├──────┼──────────────────┼───────────┼────┼──────┼──────┼────┤│
+│  │nginx │nginx-CVE-2024-001│CVE-2024-  │http│false │01-15 │http││
+│  │repo1 │repo1-42          │CVE-2024-  │http│false │01-15 │http││
+│  │proj1 │proj1-lodash-4.17 │lodash-4.17│http│false │01-16 │http││ ← Renovate!
+│  └──────┴──────────────────┴───────────┴────┴──────┴──────┴────┘│
+│                                                                 │
+│  DUPLICATE CHECK (known?):                                      │
+│  Sheet-এর Data tab-এ article.id খোঁজে                          │
+│  পেলে → skip (duplicate!)                                       │
+│  না পেলে → নতুন! → remember! + JIRA + Slack                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Step 8: Renovate Integration-এর জন্য তোমাকে কী করতে হবে
+
+```
+ধাপ ১: Renovate report কেমন দেখায় সেটা আমাকে দেখাও
+       (JSON? API response? GitHub issue? PR?)
+
+ধাপ ২: আমি বলবো কিভাবে parse করতে হবে
+
+ধাপ ৩: নতুন 2টা file বানাও:
+       - lib/gulli/collect_renovate_alerts.rb (collector)
+       - lib/gulli/feed_entry/renovate.rb (entry class)
+
+ধাপ ৪: lib/gulli.rb এ register করো
+
+ধাপ ৫: Google Sheet-এর Feeds tab-এ entry add করো
+
+ধাপ ৬: Run করো — Renovate updates Gulli-তে track হবে!
+```
+
+**তোমার কাছে Renovate report কেমন format-এ আছে? JSON file? API? GitHub PR?** সেটা দেখাও, আমি exact parsing code লিখে দেবো।
